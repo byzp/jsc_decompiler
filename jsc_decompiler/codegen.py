@@ -1,0 +1,139 @@
+"""Bytecode stream decoder: opcode identification + operand extraction."""
+import struct
+from .opcodes import get_op_info
+from .utils import r_be, s32, s8
+
+_JUMP_NAMES = frozenset({
+    'goto', 'ifeq', 'ifne', 'or', 'and',
+    'label', 'case', 'default', 'gosub', 'backpatch',
+})
+
+_CALL_NAMES = frozenset({
+    'call', 'new', 'funcall', 'eval', 'funapply',
+})
+
+_IDX_NAMES = frozenset({
+    'name', 'bindname', 'setname', 'getprop', 'setprop', 'callprop', 'string',
+    'implicitthis', 'callname', 'defvar', 'defconst', 'delname', 'delprop',
+    'getgname', 'setgname', 'bindgname', 'initprop',
+    'getintrinsic', 'setintrinsic', 'bindintrinsic', 'callintrinsic', 'callgname',
+    'deffun', 'lambda', 'newobject', 'object', 'regexp', 'setconst', 'double',
+    'getter', 'setter', 'getxprop', 'getfunns', 'length',
+    'incname', 'decname', 'nameinc', 'namedec',
+    'incprop', 'decprop', 'propinc', 'propdec',
+    'incgname', 'decgname', 'gnameinc', 'gnamedec',
+    'incarg', 'decarg', 'arginc', 'argdec',
+    'inclocal', 'declocal', 'localinc', 'localdec',
+    'enterlet0', 'enterlet1', 'enterblock',
+})
+
+_ALIASED_NAMES = frozenset({
+    'getaliasedvar', 'setaliasedvar', 'callaliasedvar',
+    'incaliasedvar', 'decaiasedvar', 'aliasedvarinc', 'aliasedvardec',
+})
+
+_ARG_NAMES = frozenset({
+    'getarg', 'setarg', 'callarg',
+    'incarg', 'decarg', 'arginc', 'argdec',
+})
+
+_LOCAL_NAMES = frozenset({
+    'getlocal', 'setlocal', 'calllocal',
+    'inclocal', 'declocal', 'localinc', 'localdec',
+})
+
+
+def parse_code(decompiler):
+    d = decompiler.data
+    o = decompiler.code_start
+    end = min(decompiler.code_end, len(d))
+    max_ops = 50000
+    op_count = 0
+    max_target = o
+    while o < end and op_count < max_ops:
+        op_byte = d[o]
+        info = get_op_info(op_byte, decompiler._is_cocos)
+        nm = info['name']
+        ol = info['length']
+        params = _extract_params(d, o, nm, ol)
+        if ol <= 0:
+            ol = 1
+        # Track max jump target for closing braces
+        if 'offset' in params:
+            tgt = o + ol + params['offset']
+            max_target = max(max_target, tgt)
+        decompiler.ops.append({'off': o, 'nm': nm, 'params': params, 'len': ol})
+        o += ol
+        op_count += 1
+    decompiler.off = o
+    # If jumps go past code_end, extend catch-up
+    if max_target > decompiler.code_end and max_target < len(d):
+        while o < max_target and op_count < max_ops:
+            op_byte = d[o]
+            info = get_op_info(op_byte, decompiler._is_cocos)
+            nm = info['name']
+            ol = info['length']
+            if ol == 255 or ol <= 0:
+                ol = 1
+            decompiler.ops.append({'off': o, 'nm': nm, 'params': {}, 'len': ol})
+            o += ol
+            op_count += 1
+        decompiler.code_end = max(decompiler.code_end, o)
+        decompiler.off = o
+
+
+def _extract_params(d, o, nm, ol):
+    p = o + 1
+    params = {}
+    try:
+        if nm in _JUMP_NAMES and p + 4 <= len(d):
+            params['offset'] = s32(r_be(d, p, 4)[0])
+        elif nm in _CALL_NAMES and p + 2 <= len(d):
+            params['argc'] = r_be(d, p, 2)[0]
+        elif nm in _ARG_NAMES and p + 2 <= len(d):
+            params['argno'] = r_be(d, p, 2)[0]
+        elif nm in _LOCAL_NAMES and p + 2 <= len(d):
+            params['localno'] = r_be(d, p, 2)[0]
+        elif nm in _IDX_NAMES and p + 4 <= len(d):
+            params['idx'] = r_be(d, p, 4)[0]
+        elif nm in _ALIASED_NAMES and p + 4 <= len(d):
+            params['hops'] = d[p]
+            params['slot'] = r_be(d, p + 1, 3)[0]
+        elif nm == 'tableswitch' and p + 12 <= len(d):
+            params['len'] = s32(r_be(d, p, 4)[0])
+            params['low'] = s32(r_be(d, p + 4, 4)[0])
+            params['high'] = s32(r_be(d, p + 8, 4)[0])
+            span = params['high'] - params['low'] + 1
+            if 0 <= span <= 0x10000:
+                ol = max(1, 1 + 12 + span * 4)
+            params['_real_len'] = ol
+        elif nm == 'int8' and p < len(d):
+            params['val'] = s8(d[p])
+        elif nm == 'uint16' and p + 2 <= len(d):
+            params['val'] = r_be(d, p, 2)[0]
+        elif nm == 'uint24' and p + 3 <= len(d):
+            params['val'] = r_be(d, p, 3)[0]
+        elif nm == 'int32' and p + 4 <= len(d):
+            params['val'] = s32(r_be(d, p, 4)[0])
+        elif nm == 'popn' and p + 2 <= len(d):
+            params['n'] = r_be(d, p, 2)[0]
+        elif nm == 'pick' and p < len(d):
+            params['n'] = d[p]
+        elif nm == 'dup' and p + 3 <= len(d):
+            params['n'] = r_be(d, p, 3)[0]
+        elif nm == 'newinit' and p + 4 <= len(d):
+            params['kind'] = d[p]
+            params['extra'] = r_be(d, p + 1, 3)[0]
+        elif nm == 'newarray' and p + 3 <= len(d):
+            params['length'] = r_be(d, p, 3)[0]
+        elif nm == 'initelem_array' and p + 3 <= len(d):
+            params['index'] = r_be(d, p, 3)[0]
+        elif nm == 'enumconstelem' and p + 3 <= len(d):
+            params['index'] = r_be(d, p, 3)[0]
+        elif nm == 'lineno' and p + 2 <= len(d):
+            params['lineno'] = r_be(d, p, 2)[0]
+        elif nm == 'iter' and p < len(d):
+            params['flags'] = d[p]
+    except (IndexError, struct.error):
+        pass
+    return params
