@@ -87,9 +87,9 @@ class JSCDecompiler:
             natoms_f = fields[4]
             nobjects_f = fields[7]
 
-            if not (1 <= codelen <= 5000): break
-            if natoms_f > 500: break
-            if nobjects_f > 100: break
+            if not (1 <= codelen <= 5000): continue
+            if natoms_f > 500: continue
+            if nobjects_f > 100: continue
 
             # Valid object found: create nested decompiler
             hdr_end = o2 + 52
@@ -98,6 +98,7 @@ class JSCDecompiler:
             # Read atoms sequentially from hdr_end until non-atom data
             var_slots_end = hdr_end
             slot_count = 0
+            var_slot_names = []
             while var_slots_end + 4 <= len(d):
                 al = struct.unpack_from('<I', d, var_slots_end)[0]
                 if al <= 0 or al > 500: break
@@ -107,12 +108,16 @@ class JSCDecompiler:
                     s = d[var_slots_end+4:var_slots_end+4+sz].decode('utf-16le')
                     if any(ord(c) > 0x7f for c in s): break
                 except: break
+                var_slot_names.append(s)
                 var_slots_end += 4 + sz
                 slot_count += 1
                 if slot_count > 100: break  # safety
             var_slots_end += slot_count  # skip 1 byte per slot
             code_start = var_slots_end + 16  # +4 extra DWORDs
             if code_start + codelen > len(d): break
+
+            nargs = (fields[0] >> 16) & 0xFFFF
+            argvs = var_slot_names[:nargs] if nargs > 0 and var_slot_names else []
 
             sub = JSCDecompiler(d, dump_bytecode=self.dump_bytecode, parent=self)
             sub.code_start = code_start
@@ -122,6 +127,8 @@ class JSCDecompiler:
                        'nobj': nobjects_f, 'nreg': 0, 'ntry': 0, 'nblk': 0,
                        'sbits': fields[12]}
             sub._is_cocos = True
+            sub.argvs = argvs
+            sub.hdr['nargs'] = nargs
             sub.off = code_start
             parse_code(sub)
             # Atom table: nsrcnotes bytes after code, then atoms.
@@ -170,6 +177,8 @@ class JSCDecompiler:
             engine = DecompileEngine(sub)
             engine.run()
             sub._func_body = engine.emit()
+            if sub.nested_funcs:
+                sub._func_body = sub._assemble_output()
             sub._is_nested = True
 
             objects.append({'name': '', 'sub': sub, 'idx': obj_idx})
@@ -183,22 +192,35 @@ class JSCDecompiler:
 
     def _assemble_output(self):
         result = self._func_body
-        # Multi-pass: repeatedly replace until no __FN_ markers remain
         max_passes = 10
         for _ in range(max_passes):
             found = False
             for idx, entry in self.nested_funcs:
                 sub = entry.get('sub') if isinstance(entry, dict) else entry
-                if sub and hasattr(sub, '_func_body'):
-                    marker = f'__FN_{idx}__'
-                    if marker in result:
-                        found = True
-                        body = sub._func_body.replace('\n// source:', '')
-                        body = body.strip()
-                        if body.endswith(';'):
-                            body = body[:-1]
-                        indent = '\n'.join('    ' + l for l in body.split('\n'))
-                        result = result.replace(marker, indent)
+                if not sub or not hasattr(sub, '_func_body'):
+                    continue
+                body = sub._func_body.replace('\n// source:', '')
+                body = body.strip()
+                if body.endswith(';'):
+                    body = body[:-1]
+                args = ', '.join(sub.argvs) if hasattr(sub, 'argvs') and sub.argvs else ''
+
+                # deffun: __F_N__ marker (body) and __A_N__ marker (args)
+                marker_f = f'__F_{idx}__'
+                if marker_f in result:
+                    found = True
+                    indent_body = '\n'.join('    ' + l for l in body.split('\n'))
+                    result = result.replace(marker_f, indent_body)
+                    result = result.replace(f'__A_{idx}__', args)
+
+                # lambda: __L_N__ marker → wrap as function expression
+                marker_l = f'__L_{idx}__'
+                if marker_l in result:
+                    found = True
+                    wrapped = f'function({args}) {{\n{body}\n}}'
+                    indent_fn = '\n'.join('    ' + l for l in wrapped.split('\n'))
+                    result = result.replace(marker_l, indent_fn)
+
             if not found:
                 break
         return result

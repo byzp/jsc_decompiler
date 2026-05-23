@@ -180,7 +180,9 @@ class DecompileEngine:
             aname = self._atom(p.get('idx', 0))
             val_str = val.get_value()
             if val.type == 'function':
-                val_str = 'function(){ ' + val_str + ' }'
+                fv = str(val.value) if val.value is not None else ''
+                if not fv.startswith('__L_'):
+                    val_str = 'function(){ ' + val_str + ' }'
             self._push(tp='script',
                        script=f'{obj.get_value()}.{aname}={val_str}')
         elif nm == 'delprop':
@@ -222,7 +224,11 @@ class DecompileEngine:
             name = s.name if s.name else self._atom(p.get('idx', 0))
             fn_body = ''
             if val.type == 'function':
-                fn_body = f'function(){{ {val.value} }}'
+                fv = str(val.value) if val.value is not None else ''
+                if fv.startswith('__L_'):
+                    fn_body = fv
+                else:
+                    fn_body = f'function(){{ {fv} }}'
             else:
                 fn_body = val.get_value()
             self._push(tp='script', name=name, script=f'{name}={fn_body}')
@@ -238,10 +244,10 @@ class DecompileEngine:
         elif nm == 'deffun':
             idx = p.get('idx', 0)
             fname = self._atom(idx) if idx < len(self.atoms) else f'f{idx}'
-            self._w(o, f'function {fname}() {{ __FN_{idx}__ }}')
+            self._w(o, f'function {fname}(__A_{idx}__) {{ __F_{idx}__ }}')
         elif nm == 'lambda':
             idx = p.get('idx', 0)
-            self._push(tp='function', value=f'__FN_{idx}__')
+            self._push(tp='function', value=f'__L_{idx}__')
         elif nm == 'getfunns':
             self._push(tp='function', value=p.get('idx', 0))
 

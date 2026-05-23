@@ -28,7 +28,7 @@ class StackItem:
         if self.type in ('null', 'undefined', 'void'):
             return self.type
         if self.type == 'function':
-            if self.value and '__FN_' in str(self.value):
+            if self.value and ('__FN_' in str(self.value) or '__L_' in str(self.value) or '__F_' in str(self.value)):
                 return str(self.value)
             return '(function(){/* nested */})'
         if self.type == 'regexp' and self.value:
