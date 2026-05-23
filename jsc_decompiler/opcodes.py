@@ -241,7 +241,7 @@ IMAGE_OPS = {
 
 NOOP_NAMES = frozenset({
     'nop', 'endinit', 'retrval', 'loopentry',
-    'lineno', 'goto', 'label', 'backpatch',
+    'lineno', 'label', 'backpatch',
     'pos', 'setcall', 'callee',
     'gosub', 'toid', 'generator',
     'enterblock', 'debugger',

@@ -17,6 +17,10 @@ class DecompileEngine:
         self._sub_level = 0
         self._open_ifs = []  # stack of (ifeq_offset, target_offset)
         self._block_depth = 0  # track switch/try/block opens that need }
+        self._switch_labels = {}  # target_offset → 'case val:' / 'default:'
+        self._in_switch = False
+        self._switch_default_target = 0
+        self._switch_ifs_start = 0
 
     def run(self):
         for op in self.d.ops:
@@ -52,6 +56,27 @@ class DecompileEngine:
     # ────────────────────────────────────────────────────
     def _dispatch(self, op):
         nm = op['nm']; p = op['params']; o = op['off']
+
+        # Check for pending switch case/default labels at this offset
+        if o in self._switch_labels:
+            labels = self._switch_labels[o]
+            has_default = any(lb == 'default:' for lb in labels)
+            if has_default:
+                # Close switch; default is empty with shared code after
+                self._w(o, 'default:\nbreak;\n}')
+                if self._block_depth > 0:
+                    self._block_depth -= 1
+                self._in_switch = False
+            else:
+                # Close if-blocks from previous case before writing new case label
+                new_ifs = len(self._open_ifs) - self._switch_ifs_start
+                if new_ifs > 0:
+                    prefix = '\n'.join('}' for _ in range(new_ifs)) + '\n'
+                    self._open_ifs = self._open_ifs[:self._switch_ifs_start]
+                else:
+                    prefix = ''
+                self._w(o, prefix + '\n'.join(labels))
+            del self._switch_labels[o]
 
         if nm == 'implicitthis' and self.d._is_cocos:
             return
@@ -99,7 +124,7 @@ class DecompileEngine:
         # branching
         elif nm == 'ifeq':
             v = self._pop()
-            tgt = o + op['len'] + p.get('offset', 0)
+            tgt = o + p.get('offset', 0)
             cond = v.get_value()
             if p.get('offset', 0) > 0:
                 self._w(o, f'if ({cond}) {{')
@@ -111,7 +136,7 @@ class DecompileEngine:
 
         elif nm == 'ifne':
             v = self._pop()
-            tgt = o + op['len'] + p.get('offset', 0)
+            tgt = o + p.get('offset', 0)
             if p.get('offset', 0) > 0:
                 self._w(o, 'if (' + v.get_value() + ') {')
                 self._open_ifs.append((o, tgt))
@@ -124,38 +149,34 @@ class DecompileEngine:
             pass
 
         elif nm == 'goto':
-            tgt = o + op['len'] + p.get('offset', 0)
+            tgt = o + p.get('offset', 0)
             if p.get('offset', 0) < 0:
                 self._w(o, 'continue;')
             elif p.get('offset', 0) > 0:
-                # If goto goes to end of function, close all open ifs
-                if tgt >= self.d.code_end - 8:
-                    close_count = len(self._open_ifs)
-                    self._open_ifs.clear()
-                    self._w(o, '')
-                    self._w(tgt, '}' * close_count)
-                else:
-                    br = self.branch_map.get(tgt)
-                    if br and br.get('type') == 'if':
-                        # Pop IFEQs with this target
+                if self._in_switch:
+                    if tgt == self._switch_default_target:
+                        self._w(o, 'break;')
+                    elif any(t == tgt for _, t in self._open_ifs):
                         while self._open_ifs and self._open_ifs[-1][1] == tgt:
                             self._open_ifs.pop()
                         self._w(o, '')
                         self._w(tgt, '}')
-                    else:
-                        self._w(o, 'break;')
-                        self._w(tgt, '}')
+                elif tgt >= self.d.code_end - 8:
+                    close_count = len(self._open_ifs)
+                    self._open_ifs.clear()
+                    self._w(o, '')
+                    self._w(tgt, '}' * close_count)
         elif nm == 'or':
             v = self._pop()
             self.logic_stacks[o] = {
-                'type': 'or', 'goto': o + op['len'] + p.get('offset', 0),
+                'type': 'or', 'goto': o + p.get('offset', 0),
                 'value': v.get_value(),
             }
             self._push(tp='logic')
         elif nm == 'and':
             v = self._pop()
             self.logic_stacks[o] = {
-                'type': 'and', 'goto': o + op['len'] + p.get('offset', 0),
+                'type': 'and', 'goto': o + p.get('offset', 0),
                 'value': v.get_value(),
             }
             self._push(tp='logic')
@@ -420,16 +441,32 @@ class DecompileEngine:
             self._w(o, '}')
             if self._block_depth > 0:
                 self._block_depth -= 1
+            self._in_switch = False
+            self._switch_labels = {}
 
         # switch
         elif nm == 'condswitch':
-            self._w(o, 'switch(' + self._pop().get_value() + '){')
+            v = self.d.stack[-1] if self.d.stack else StackItem()
+            self._w(o, 'switch(' + v.get_value() + '){')
             self._block_depth += 1
+            self._in_switch = True
+            self._switch_labels = {}
+            self._switch_ifs_start = len(self._open_ifs)
         elif nm == 'case':
-            val = self._pop(); sv = self._pop()
-            self._w(o, 'case ' + val.get_value() + ':')
+            val = self._pop()  # pop case value; switch value stays on stack
+            tgt = o + p.get('offset', 0)
+            label_text = 'case ' + val.get_value() + ':'
+            if tgt not in self._switch_labels:
+                self._switch_labels[tgt] = []
+            self._switch_labels[tgt].append(label_text)
         elif nm == 'default':
-            self._w(o, 'default:')
+            if self.d.stack:
+                self._pop()  # pop the switch value
+            tgt = o + p.get('offset', 0)
+            self._switch_default_target = tgt
+            if tgt not in self._switch_labels:
+                self._switch_labels[tgt] = []
+            self._switch_labels[tgt].append('default:')
 
         # misc
         elif nm in ('spread', 'getxprop', 'getter', 'setter',
