@@ -162,11 +162,10 @@ class DecompileEngine:
         elif nm in ('call', 'new', 'funcall', 'eval', 'funapply'):
             argc = p.get('argc', 0)
             argv = [self._pop() for _ in range(argc)]
+            # After args, next is thisArg, then callee
+            this_ = self._pop()
             callee = self._pop()
             fn = callee.name if callee.name is not None else callee.get_value()
-            # If the next stack item is 'this', consume it (method call thisArg)
-            if self.d.stack and self.d.stack[-1].name == 'this':
-                self._pop()
             args = ','.join(a.get_value() for a in reversed(argv))
             pre = 'new ' if nm == 'new' else ''
             call_str = pre + fn + '(' + args + ')'
@@ -204,11 +203,12 @@ class DecompileEngine:
             self._push(tp='script', script=obj.get_value() + '.length')
 
         # name resolution
-        elif nm in ('callname', 'callgname', 'calllocal', 'callarg'):
-            # callname pushes the named value (function), similar to name
-            idx = p.get('idx', 0) if 'idx' in p else p.get('localno', p.get('argno', 0))
-            name_val = self._atom(idx) if 'idx' in p else f'_x{idx}'
+        elif nm in ('callname', 'callgname'):
+            idx = p.get('idx', 0)
+            name_val = self._atom(idx)
             self._push(name=name_val)
+            # callname doesn't push thisArg separately; add a dummy
+            self._push(tp='void', name=None, value=None)
 
         elif nm in ('name', 'bindname', 'implicitthis',
                     'getgname', 'callintrinsic',
@@ -246,7 +246,7 @@ class DecompileEngine:
             self._push(tp='function', value=p.get('idx', 0))
 
         # args / locals
-        elif nm == 'getarg':
+        elif nm == 'getarg' or nm == 'callarg':
             an = p.get('argno', 0)
             name = self.d.argvs[an] if an < len(self.d.argvs) else f'a{an}'
             self._push(name=name)
@@ -254,11 +254,11 @@ class DecompileEngine:
             val = self._pop(); an = p.get('argno', 0)
             name = self.d.argvs[an] if an < len(self.d.argvs) else f'a{an}'
             self._push(tp='script', name=name, script=f'{name}={val.get_value()}')
-        elif nm == 'getlocal':
+        elif nm == 'getlocal' or nm == 'calllocal':
             ln = p.get('localno', 0)
             lv = self.d.local_vars.get(ln)
             if lv:
-                self._push(name=lv.name)  # just the variable name, not the full assignment
+                self._push(name=lv.name)
             else:
                 self._push(name=f'l{ln}')
         elif nm == 'setlocal':

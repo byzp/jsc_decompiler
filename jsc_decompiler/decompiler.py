@@ -124,22 +124,31 @@ class JSCDecompiler:
             sub._is_cocos = True
             sub.off = code_start
             parse_code(sub)
-            # Sequential atoms for sub-function: find them after code
-            # Scan from code_end for first valid atom pattern
-            atom_start = sub.code_end
-            while atom_start < len(d) - 8:
-                al = struct.unpack_from('<I', d, atom_start)[0]
-                if 1 <= al <= 200:
+            # Atom table: nsrcnotes bytes after code, then atoms.
+            # fields[5] may be slightly off; scan near the expected position.
+            nsrc = sub.hdr.get('nsrc', 0)
+            search_start = max(sub.code_end, sub.code_end + nsrc - 30)
+            search_end = min(len(d) - 20, sub.code_end + nsrc + 50)
+            atom_start = search_start
+            best_start = atom_start; best_count = 0
+            while atom_start < search_end:
+                temp = atom_start; count = 0
+                for _ in range(5):
+                    if temp + 4 > len(d): break
+                    al = struct.unpack_from('<I', d, temp)[0]
+                    if not (1 <= al <= 200): break
                     sz = al * 2
-                    if atom_start + 4 + sz <= len(d):
-                        try:
-                            s = d[atom_start+4:atom_start+4+sz].decode('utf-16le')
-                            if all(ord(c) < 0x80 for c in s) and len(s) > 1:
-                                break
-                        except: pass
+                    if temp + 4 + sz > len(d): break
+                    try:
+                        s = d[temp+4:temp+4+sz].decode('utf-16le')
+                        if not all(ord(c) < 0x80 for c in s): break
+                    except: break
+                    count += 1; temp = temp + 4 + sz
+                if count > best_count: best_count = count; best_start = atom_start
+                if count >= 3: break
                 atom_start += 1
             sub_atoms = []
-            sub_off = atom_start
+            sub_off = best_start
             for _ in range(natoms_f):
                 if sub_off + 4 > len(d): break
                 al = struct.unpack_from('<I', d, sub_off)[0]; sub_off += 4
@@ -174,13 +183,22 @@ class JSCDecompiler:
 
     def _assemble_output(self):
         result = self._func_body
-        for idx, entry in self.nested_funcs:
-            sub = entry.get('sub') if isinstance(entry, dict) else entry
-            if sub and hasattr(sub, '_func_body'):
-                body = sub._func_body.replace('\n// source:', '')
-                body = body.strip()
-                if body.endswith(';'):
-                    body = body[:-1]
-                indent = '\n'.join('    ' + l for l in body.split('\n'))
-                result = result.replace(f'__FN_{idx}__', indent, 1)
+        # Multi-pass: repeatedly replace until no __FN_ markers remain
+        max_passes = 10
+        for _ in range(max_passes):
+            found = False
+            for idx, entry in self.nested_funcs:
+                sub = entry.get('sub') if isinstance(entry, dict) else entry
+                if sub and hasattr(sub, '_func_body'):
+                    marker = f'__FN_{idx}__'
+                    if marker in result:
+                        found = True
+                        body = sub._func_body.replace('\n// source:', '')
+                        body = body.strip()
+                        if body.endswith(';'):
+                            body = body[:-1]
+                        indent = '\n'.join('    ' + l for l in body.split('\n'))
+                        result = result.replace(marker, indent)
+            if not found:
+                break
         return result
