@@ -16,6 +16,7 @@ class DecompileEngine:
         self.loop_entries = set()
         self._sub_level = 0
         self._open_ifs = []  # stack of (ifeq_offset, target_offset)
+        self._block_depth = 0  # track switch/try/block opens that need }
 
     def run(self):
         for op in self.d.ops:
@@ -23,11 +24,12 @@ class DecompileEngine:
                 self._dispatch(op)
             except Exception:
                 pass
-        # Close any remaining open if-blocks at function end
-        if self._open_ifs:
+        # Close any remaining open blocks at function end
+        close_count = len(self._open_ifs) + self._block_depth
+        if close_count > 0:
             last_off = self.d.ops[-1]['off'] if self.d.ops else 0
-            close_count = len(self._open_ifs)
             self._open_ifs.clear()
+            self._block_depth = 0
             self._w(last_off, '}' * close_count)
 
     def _push(self, **kw):
@@ -397,6 +399,7 @@ class DecompileEngine:
         # try / catch
         elif nm == 'try':
             self._w(o, 'try {')
+            self._block_depth += 1
         elif nm == 'throw':
             self._w(o, 'throw ' + self._pop().get_value() + ';')
         elif nm == 'throwing':
@@ -410,13 +413,18 @@ class DecompileEngine:
             self._push(tp='void', value=None)
         elif nm == 'retsub':
             self._w(o, '}')
+            if self._block_depth > 0:
+                self._block_depth -= 1
             self._pop(); self._pop()
         elif nm in ('leaveblock', 'leaveblockexpr'):
             self._w(o, '}')
+            if self._block_depth > 0:
+                self._block_depth -= 1
 
         # switch
         elif nm == 'condswitch':
             self._w(o, 'switch(' + self._pop().get_value() + '){')
+            self._block_depth += 1
         elif nm == 'case':
             val = self._pop(); sv = self._pop()
             self._w(o, 'case ' + val.get_value() + ':')
