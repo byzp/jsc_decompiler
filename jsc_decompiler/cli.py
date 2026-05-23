@@ -1,4 +1,4 @@
-"""Command-line entry points: single file and batch mode."""
+"""Command-line entry points: single file, batch mode, and refs analysis."""
 import os
 import sys
 from .decompiler import JSCDecompiler
@@ -8,16 +8,48 @@ def main():
     if len(sys.argv) < 2:
         print(f'Usage: {sys.argv[0]} <input.jsc[z]> [output.js]')
         print(f'       {sys.argv[0]} --batch <input_dir> <output_dir>')
+        print(f'       {sys.argv[0]} --refs <decompiled_dir> [--json|--inject]')
+        print(f'       {sys.argv[0]} --imports <decompiled_dir>   # variable-based analysis')
         print(f'       add --dump-bytecode for disassembly comments')
         sys.exit(1)
 
     dump_bytecode = '--dump-bytecode' in sys.argv
     args = [a for a in sys.argv[1:] if a != '--dump-bytecode']
 
-    if args[0] == '--batch':
+    if args[0] == '--refs':
+        _refs_mode(args[1:])
+    elif args[0] == '--imports':
+        _imports_mode(args[1:])
+    elif args[0] == '--batch':
         _batch_mode(args[1], args[2], dump_bytecode)
     else:
         _single_mode(args, dump_bytecode)
+
+
+def _refs_mode(args):
+    """Analyze references between decompiled JS files."""
+    from .refs import cli_analyze
+    decompiled_dir = args[0] if args else 'decompiled_scripts'
+    fmt = 'text'
+    if '--json' in args:
+        fmt = 'json'
+    if '--inject' in args:
+        fmt = 'inject'
+    out_file = None
+    for a in args[1:]:
+        if a not in ('--json', '--inject'):
+            out_file = a
+    cli_analyze(decompiled_dir, output_file=out_file, format=fmt)
+
+
+def _imports_mode(args):
+    """Analyze and inject variable-based imports."""
+    from .var_analysis import cli_inject, cli_show_missing
+    decompiled_dir = args[0] if args else 'decompiled_scripts'
+    if '--show' in args:
+        cli_show_missing(decompiled_dir)
+    else:
+        cli_inject(decompiled_dir)
 
 
 def _single_mode(args, dump_bytecode):
@@ -37,7 +69,7 @@ def _single_mode(args, dump_bytecode):
         print(result)
 
 
-def _batch_mode(indir, outdir, dump_bytecode):
+def _batch_mode(indir, outdir, dump_bytecode, inject_refs=True):
     os.makedirs(outdir, exist_ok=True)
     count = 0
     errors = []
@@ -64,7 +96,6 @@ def _batch_mode(indir, outdir, dump_bytecode):
                     f.write(f' atoms={len(dec.atoms)} code={dec.hdr.get("codelen",0)}\n')
                     f.write(result + '\n')
                 count += 1
-                print(f'  OK: {rel}')
             except Exception as e:
                 errors.append((rel, str(e)))
                 print(f'  ERR: {rel}: {e}')
@@ -72,6 +103,12 @@ def _batch_mode(indir, outdir, dump_bytecode):
     if errors:
         for rel, err in errors:
             print(f'  ERR: {rel}: {err}')
+
+    # Inject variable-based references into decompiled files
+    if inject_refs:
+        from .var_analysis import inject_imports
+        updated = inject_imports(outdir)
+        print('Injected variable imports into {} files'.format(updated))
 
 
 if __name__ == '__main__':
