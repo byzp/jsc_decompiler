@@ -11,10 +11,15 @@ def main():
         print(f'       {sys.argv[0]} --refs <decompiled_dir> [--json|--inject]')
         print(f'       {sys.argv[0]} --imports <decompiled_dir>   # variable-based analysis')
         print(f'       add --dump-bytecode for disassembly comments')
+        print(f'       add --ascii-escapes to emit \\\\uXXXX instead of raw Unicode')
         sys.exit(1)
 
     dump_bytecode = '--dump-bytecode' in sys.argv
-    args = [a for a in sys.argv[1:] if a != '--dump-bytecode']
+    ascii_escapes = '--ascii-escapes' in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ('--dump-bytecode', '--ascii-escapes')]
+
+    from . import stack
+    stack.set_unicode_mode(ascii_escapes)
 
     if args[0] == '--refs':
         _refs_mode(args[1:])

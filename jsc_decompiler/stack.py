@@ -1,6 +1,14 @@
 """StackItem – the value trackable on the virtual operand stack."""
 import json
 
+_ensure_ascii = False  # set True to emit \\uXXXX escapes
+
+
+def set_unicode_mode(ascii_escapes):
+    """If ascii_escapes=True, strings use \\uXXXX; else native Unicode."""
+    global _ensure_ascii
+    _ensure_ascii = ascii_escapes
+
 
 class StackItem:
     __slots__ = ('type', 'name', 'value', 'script')
@@ -17,7 +25,7 @@ class StackItem:
         if self.name is not None:
             return self.name
         if self.type == 'string':
-            return json.dumps(self.value)
+            return json.dumps(self.value, ensure_ascii=_ensure_ascii)
         if self.type == 'number' and self.value is not None:
             s = str(self.value)
             if s.endswith('.0'):
@@ -37,15 +45,15 @@ class StackItem:
             if isinstance(self.value, dict) and self.value:
                 items = []
                 for k, v in self.value.items():
-                    vstr = v.get_value() if isinstance(v, StackItem) else json.dumps(v)
-                    items.append(f'{k}:{vstr}')
+                    vstr = v.get_value() if isinstance(v, StackItem) else json.dumps(v, ensure_ascii=_ensure_ascii)
+                    items.append('{}:{}'.format(k, vstr))
                 return '{' + ','.join(items) + '}'
             return '{}'
         if self.type == 'array':
             if isinstance(self.value, list) and self.value:
                 items = []
                 for v in self.value:
-                    vstr = v.get_value() if isinstance(v, StackItem) else json.dumps(v)
+                    vstr = v.get_value() if isinstance(v, StackItem) else json.dumps(v, ensure_ascii=_ensure_ascii)
                     items.append(vstr)
                 return '[' + ','.join(items) + ']'
             return '[]'
