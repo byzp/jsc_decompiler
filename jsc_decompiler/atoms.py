@@ -6,8 +6,7 @@ from .utils import r_le
 def parse_atoms_consts(decompiler):
     """Extract atoms / constants into self.atoms / self.consts."""
     if decompiler._is_cocos:
-        decompiler.atoms = _scan_cocos_atoms(decompiler.data, decompiler.code_end)
-        decompiler.consts = []
+        _parse_cocos51_sequential(decompiler)
     else:
         _parse_standard_atoms(decompiler)
         _parse_standard_consts(decompiler)

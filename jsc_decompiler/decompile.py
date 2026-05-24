@@ -387,8 +387,8 @@ class DecompileEngine:
         # objects / arrays
         elif nm == 'newinit':
             kind = p.get('kind', 0)
-            self._push(tp='object' if kind == 0 else 'array',
-                       value=[_OBJECT_LITERAL_SKIP])
+            self._push(tp='object',
+                       value={} if kind == 0 else {})
         elif nm == 'newarray':
             self._push(tp='array', value=[])
         elif nm in ('newobject', 'object'):

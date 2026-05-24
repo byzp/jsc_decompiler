@@ -34,8 +34,20 @@ class StackItem:
         if self.type == 'regexp' and self.value:
             return str(self.value)
         if self.type == 'object':
+            if isinstance(self.value, dict) and self.value:
+                items = []
+                for k, v in self.value.items():
+                    vstr = v.get_value() if isinstance(v, StackItem) else json.dumps(v)
+                    items.append(f'{k}:{vstr}')
+                return '{' + ','.join(items) + '}'
             return '{}'
         if self.type == 'array':
+            if isinstance(self.value, list) and self.value:
+                items = []
+                for v in self.value:
+                    vstr = v.get_value() if isinstance(v, StackItem) else json.dumps(v)
+                    items.append(vstr)
+                return '[' + ','.join(items) + ']'
             return '[]'
         return str(self.value) if self.value is not None else 'undefined'
 
