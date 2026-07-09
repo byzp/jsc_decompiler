@@ -43,7 +43,7 @@ class JSCDecompiler:
     def _cocos51_parse_objects(self):
         d = self.data
         nobj = self.hdr.get('nobj', 0)
-        if nobj <= 0 or nobj > 200:
+        if nobj <= 0 or nobj > 500:
             return
 
         # Object entries: tag(4) + sentinel(4) = 8 bytes each, then function data.
@@ -87,9 +87,27 @@ class JSCDecompiler:
             natoms_f = fields[4]
             nobjects_f = fields[7]
 
-            if not (1 <= codelen <= 5000): continue
-            if natoms_f > 500: continue
-            if nobjects_f > 100: continue
+            if not (1 <= codelen <= 50000) or natoms_f > 500 or nobjects_f > 500:
+                # Skip this object but advance o to avoid desync
+                # Try to advance past the header + variable slots + code
+                skip_end = o2 + 52
+                # Skip variable slots
+                while skip_end + 4 <= len(d):
+                    al = struct.unpack_from('<I', d, skip_end)[0]
+                    if al <= 0 or al > 500: break
+                    sz = al * 2
+                    if skip_end + 4 + sz > len(d): break
+                    try:
+                        s = d[skip_end+4:skip_end+4+sz].decode('utf-16le')
+                        if any(ord(c) > 0x7f for c in s): break
+                    except: break
+                    skip_end += 4 + sz
+                # Skip 1 byte per slot + 16 bytes + code
+                slot_cnt = (skip_end - (o2 + 52)) // 6  # rough estimate
+                skip_end += slot_cnt + 16 + codelen
+                if skip_end > o:
+                    o = skip_end
+                continue
 
             # Valid object found: create nested decompiler
             hdr_end = o2 + 52
@@ -140,7 +158,10 @@ class JSCDecompiler:
             best_start = atom_start; best_count = 0
             while atom_start < search_end:
                 temp = atom_start; count = 0
-                for _ in range(5):
+                for _ in range(natoms_f + 2):  # allow extra iterations for zero-padding
+                    # Skip zero-padding
+                    while temp + 4 <= len(d) and struct.unpack_from('<I', d, temp)[0] == 0:
+                        temp += 4
                     if temp + 4 > len(d): break
                     al = struct.unpack_from('<I', d, temp)[0]
                     if not (1 <= al <= 200): break
@@ -157,9 +178,13 @@ class JSCDecompiler:
             sub_atoms = []
             sub_off = best_start
             for _ in range(natoms_f):
+                # Skip zero-padding words between atoms
+                while sub_off + 4 <= len(d) and struct.unpack_from('<I', d, sub_off)[0] == 0:
+                    sub_off += 4
                 if sub_off + 4 > len(d): break
                 al = struct.unpack_from('<I', d, sub_off)[0]; sub_off += 4
                 if al <= 0 or al > 500: break
+                # Stop if we hit a tag sentinel (0xFFFFFFFF after a zero)
                 sz = al * 2
                 if sub_off + sz > len(d): break
                 try:
@@ -183,12 +208,13 @@ class JSCDecompiler:
 
             objects.append({'name': '', 'sub': sub, 'idx': obj_idx})
 
-            # Advance past this object: move beyond tag+sentinel area
-            o = code_start + codelen  # past code section
+            # Advance past this object: move beyond code section
+            # The tag search will skip over srcnotes/atoms/consts to find the next tag
+            o = code_start + codelen
 
         if objects:
             self.objects = objects
-            self.nested_funcs = [(i, obj) for i, obj in enumerate(objects) if obj.get('sub') and getattr(obj['sub'], '_func_body', '')]
+            self.nested_funcs = [(i, obj) for i, obj in enumerate(objects) if obj.get('sub') and hasattr(obj['sub'], '_func_body')]
 
     def _assemble_output(self):
         result = self._func_body

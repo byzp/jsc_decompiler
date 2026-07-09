@@ -267,6 +267,13 @@ class DecompileEngine:
         elif nm == 'deffun':
             idx = p.get('idx', 0)
             fname = self._atom(idx) if idx < len(self.atoms) else f'f{idx}'
+            # Clean up function names: strip 'require ' prefix, remove path separators
+            if fname.startswith('require '):
+                fname = fname[8:]
+            fname = fname.replace('/', '_').replace('\\', '_').replace('.', '_')
+            # If name starts with # (out-of-bounds atom), use generic name
+            if fname.startswith('#'):
+                fname = f'f{idx}'
             self._w(o, f'function {fname}(__A_{idx}__) {{ __F_{idx}__ }}')
         elif nm == 'lambda':
             idx = p.get('idx', 0)
@@ -298,14 +305,51 @@ class DecompileEngine:
             self.d.local_vars[ln] = item
             self._push(**item.copy())
 
-        # inc/dec arg/local shortcuts
+        # inc/dec arg/local/prop/elem shortcuts
+        # Prefix: incX, decX (e.g. incarg, declocal, incprop, incelem, incaliasedvar, decaiasedvar)
+        # Postfix: Xinc, Xdec (e.g. arginc, localdec, propinc, eleminc, aliasedvarinc, aliasedvardec)
         elif nm in ('incarg', 'decarg', 'arginc', 'argdec',
                     'inclocal', 'declocal', 'localinc', 'localdec',
                     'incaliasedvar', 'decaiasedvar', 'aliasedvarinc', 'aliasedvardec',
                     'incprop', 'decprop', 'propinc', 'propdec',
                     'incelem', 'decelem', 'eleminc', 'elemdec'):
-            val = self._pop() if 1 else StackItem()
-            self._push(tp='script', script='(++)')
+            is_prefix = nm.startswith('inc') or nm.startswith('dec')
+            is_inc = 'inc' in nm and 'dec' not in nm
+            op = '++' if is_inc else '--'
+
+            if nm in ('incarg', 'decarg', 'arginc', 'argdec'):
+                an = p.get('argno', 0)
+                name = self.d.argvs[an] if an < len(self.d.argvs) else f'a{an}'
+                if is_prefix:
+                    self._push(tp='script', script=f'{op}{name}')
+                else:
+                    self._push(tp='script', script=f'{name}{op}')
+            elif nm in ('inclocal', 'declocal', 'localinc', 'localdec'):
+                ln = p.get('localno', 0)
+                lv = self.d.local_vars.get(ln)
+                name = lv.name if lv else f'l{ln}'
+                if is_prefix:
+                    self._push(tp='script', script=f'{op}{name}')
+                else:
+                    self._push(tp='script', script=f'{name}{op}')
+            elif nm in ('incaliasedvar', 'decaiasedvar', 'aliasedvarinc', 'aliasedvardec'):
+                if is_prefix:
+                    self._push(tp='script', script=f'{op}_av')
+                else:
+                    self._push(tp='script', script=f'_av{op}')
+            elif nm in ('incprop', 'decprop', 'propinc', 'propdec'):
+                obj = self._pop()
+                aname = self._atom(p.get('idx', 0))
+                if is_prefix:
+                    self._push(tp='script', script=f'{op}{obj.get_value()}.{aname}')
+                else:
+                    self._push(tp='script', script=f'{obj.get_value()}.{aname}{op}')
+            elif nm in ('incelem', 'decelem', 'eleminc', 'elemdec'):
+                idx = self._pop(); obj = self._pop()
+                if is_prefix:
+                    self._push(tp='script', script=f'{op}{obj.get_value()}[{idx.get_value()}]')
+                else:
+                    self._push(tp='script', script=f'{obj.get_value()}[{idx.get_value()}]{op}')
 
         elif nm == 'arguments':
             self._push(name='arguments')
