@@ -7,17 +7,18 @@ Dispatches to version-specific parser based on the magic number:
 
 All parsers return a DisasmFunc object — no decompiler dependency.
 """
+
 import struct
 from .B973C051 import parse as parse_cocos51
 from .B973C02C import parse as parse_mozjs34
 
 MAGIC_COCOS51 = 0xB973C051
 MAGIC_MOZJS34 = 0xB973C02C
-MAGIC_XDR9    = 0x00000009
+MAGIC_XDR9 = 0x00000009
 
 
 def detect_version(data):
-    return struct.unpack_from('<I', data, 0)[0]
+    return struct.unpack_from("<I", data, 0)[0]
 
 
 def parse(data):
@@ -29,4 +30,5 @@ def parse(data):
     else:
         raise ValueError(
             f"Unsupported JSC version 0x{ver:08X} "
-            f"(supported: 0xB973C051, 0xB973C02C)")
+            f"(supported: 0xB973C051, 0xB973C02C)"
+        )

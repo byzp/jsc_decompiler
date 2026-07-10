@@ -4,63 +4,165 @@ Finds which files define which globals, and which files use globals
 that are defined elsewhere. Generates /* global ... */ directives
 for ESLint no-undef suppression.
 """
+
 import os, re, json
 from collections import Counter, defaultdict
 
+_JS_KEYWORDS = frozenset(
+    {
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "this",
+        "if",
+        "else",
+        "for",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "default",
+        "break",
+        "continue",
+        "return",
+        "throw",
+        "try",
+        "catch",
+        "finally",
+        "new",
+        "typeof",
+        "instanceof",
+        "in",
+        "void",
+        "delete",
+        "var",
+        "let",
+        "const",
+        "function",
+        "arguments",
+    }
+)
 
-_JS_KEYWORDS = frozenset({
-    'true', 'false', 'null', 'undefined', 'this',
-    'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'default',
-    'break', 'continue', 'return', 'throw', 'try', 'catch', 'finally',
-    'new', 'typeof', 'instanceof', 'in', 'void', 'delete',
-    'var', 'let', 'const', 'function', 'arguments',
-})
+_JS_BUILTINS = frozenset(
+    {
+        "NaN",
+        "Infinity",
+        "Array",
+        "Object",
+        "String",
+        "Number",
+        "Boolean",
+        "Date",
+        "Error",
+        "RegExp",
+        "parseFloat",
+        "isNaN",
+        "isFinite",
+        "eval",
+        "console",
+        "window",
+        "document",
+        "global",
+        "globalThis",
+        "exports",
+        "module",
+        "process",
+        "Buffer",
+        "require",
+        "setTimeout",
+        "setInterval",
+        "clearTimeout",
+        "clearInterval",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+        "encodeURI",
+        "decodeURI",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "escape",
+        "unescape",
+        "atob",
+        "btoa",
+        "Promise",
+        "Symbol",
+        "Map",
+        "Set",
+        "WeakMap",
+        "WeakSet",
+        "Proxy",
+        "Reflect",
+        "Uint8Array",
+        "Int8Array",
+        "ArrayBuffer",
+        "DataView",
+        "Float32Array",
+        "Float64Array",
+        "Int16Array",
+        "Int32Array",
+        "Uint16Array",
+        "Uint32Array",
+        "BigInt",
+        "BigInt64Array",
+        "BigUint64Array",
+        "Iterator",
+        "Generator",
+        "alert",
+        "confirm",
+        "prompt",
+        "XMLHttpRequest",
+        "FormData",
+        "WebSocket",
+        "Worker",
+        "FileReader",
+        "Blob",
+        "File",
+        "URL",
+        "URLSearchParams",
+        "Image",
+        "navigator",
+        "location",
+        "history",
+        "localStorage",
+        "sessionStorage",
+        "screen",
+        "performance",
+        "addEventListener",
+        "removeEventListener",
+        "dispatchEvent",
+        "postMessage",
+        "onmessage",
+        "print",
+        "apply",
+        "call",
+        "bind",
+        "toString",
+        "valueOf",
+        "hasOwnProperty",
+        "propertyIsEnumerable",
+        "isPrototypeOf",
+        "__defineGetter__",
+        "__defineSetter__",
+        "__lookupGetter__",
+        "__lookupSetter__",
+        "__proto__",
+    }
+)
 
-_JS_BUILTINS = frozenset({
-    'NaN', 'Infinity',
-    'Array', 'Object', 'String', 'Number', 'Boolean', 'Date',
-    'Error', 'RegExp', 'parseFloat',
-    'isNaN', 'isFinite', 'eval',
-    'console', 'window', 'document', 'global', 'globalThis',
-    'exports', 'module', 'process', 'Buffer', 'require',
-    'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
-    'requestAnimationFrame', 'cancelAnimationFrame',
-    'encodeURI', 'decodeURI', 'encodeURIComponent', 'decodeURIComponent',
-    'escape', 'unescape', 'atob', 'btoa',
-    'Promise', 'Symbol', 'Map', 'Set', 'WeakMap', 'WeakSet',
-    'Proxy', 'Reflect',
-    'Uint8Array', 'Int8Array', 'ArrayBuffer', 'DataView',
-    'Float32Array', 'Float64Array', 'Int16Array', 'Int32Array',
-    'Uint16Array', 'Uint32Array', 'BigInt', 'BigInt64Array', 'BigUint64Array',
-    'Iterator', 'Generator',
-    'alert', 'confirm', 'prompt',
-    'XMLHttpRequest', 'FormData', 'WebSocket', 'Worker',
-    'FileReader', 'Blob', 'File', 'URL', 'URLSearchParams',
-    'Image', 'navigator', 'location', 'history',
-    'localStorage', 'sessionStorage', 'screen', 'performance',
-    'addEventListener', 'removeEventListener', 'dispatchEvent',
-    'postMessage', 'onmessage',
-    'print',
-    'apply', 'call', 'bind', 'toString', 'valueOf',
-    'hasOwnProperty', 'propertyIsEnumerable', 'isPrototypeOf',
-    '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__',
-    '__proto__',
-})
-
-_LOCAL_VAR_RE = re.compile(r'^[lv](_?\d+)$')
-_ARG_VAR_RE = re.compile(r'^a\d+$')
+_LOCAL_VAR_RE = re.compile(r"^[lv](_?\d+)$")
+_ARG_VAR_RE = re.compile(r"^a\d+$")
 
 
 def _strip_comments_strings(content):
-    lines = content.split('\n')
+    lines = content.split("\n")
     result = []
     for line in lines:
-        c = re.sub(r'//.*$', ' ', line)
-        c = re.sub(r'/\*.*?\*/', ' ', c)
+        c = re.sub(r"//.*$", " ", line)
+        c = re.sub(r"/\*.*?\*/", " ", c)
         c = re.sub(r'"[^"]*"', '""', c)
         c = re.sub(r"'[^']*'", "''", c)
         result.append(c)
-    return '\n'.join(result)
+    return "\n".join(result)
 
 
 def get_defines_uses(content):
@@ -69,16 +171,16 @@ def get_defines_uses(content):
     defined = set()
     used = set()
 
-    for m in re.finditer(r'\bvar\s+(\w+)', code):
+    for m in re.finditer(r"\bvar\s+(\w+)", code):
         defined.add(m.group(1))
-    for m in re.finditer(r'\bfunction\s+(\w+)', code):
+    for m in re.finditer(r"\bfunction\s+(\w+)", code):
         defined.add(m.group(1))
-    for m in re.finditer(r'(?<![,\{(.\[<!>=])\s*(\w{2,})\s*=', code):
+    for m in re.finditer(r"(?<![,\{(.\[<!>=])\s*(\w{2,})\s*=", code):
         defined.add(m.group(1))
-    for m in re.finditer(r'(\w+)\.prototype\.(\w+)\s*=', code):
+    for m in re.finditer(r"(\w+)\.prototype\.(\w+)\s*=", code):
         defined.add(m.group(1))
 
-    for m in re.finditer(r'\b([a-zA-Z_$][\w$]*)\b', code):
+    for m in re.finditer(r"\b([a-zA-Z_$][\w$]*)\b", code):
         name = m.group(1)
         if name in defined:
             continue
@@ -86,20 +188,34 @@ def get_defines_uses(content):
             continue
         if _ARG_VAR_RE.match(name):
             continue
-        if name.startswith('#a') or name.startswith('__') or name.startswith('_av'):
+        if name.startswith("#a") or name.startswith("__") or name.startswith("_av"):
             continue
         if name in _JS_BUILTINS:
             continue
         if len(name) <= 1:
             continue
-        if name in ('nargs', 'nvars', 'code', 'ver', 'Version', 'Decompiled',
-                     'jscz', 'source', 'atoms', 'from', 'References',
-                     'Res_ref', 'Scripts', 'End', 'jscz'):
+        if name in (
+            "nargs",
+            "nvars",
+            "code",
+            "ver",
+            "Version",
+            "Decompiled",
+            "jscz",
+            "source",
+            "atoms",
+            "from",
+            "References",
+            "Res_ref",
+            "Scripts",
+            "End",
+            "jscz",
+        ):
             continue
         used.add(name)
 
-    for m in re.finditer(r'function\s*\w*\s*\((.*?)\)', code):
-        for arg in re.findall(r'\w+', m.group(1)):
+    for m in re.finditer(r"function\s*\w*\s*\((.*?)\)", code):
+        for arg in re.findall(r"\w+", m.group(1)):
             used.discard(arg)
 
     return defined, used
@@ -112,20 +228,25 @@ def build_global_map(decompiled_dir):
 
     for root, dirs, filenames in os.walk(decompiled_dir):
         for fn in sorted(filenames):
-            if not fn.endswith('.js'):
+            if not fn.endswith(".js"):
                 continue
             fp = os.path.join(root, fn)
-            rel = os.path.relpath(fp, decompiled_dir).replace('\\', '/')
+            rel = os.path.relpath(fp, decompiled_dir).replace("\\", "/")
             try:
-                with open(fp, encoding='utf-8', errors='replace') as f:
+                with open(fp, encoding="utf-8", errors="replace") as f:
                     content = f.read()
             except Exception:
                 continue
             defined, used = get_defines_uses(content)
 
-            exports = {d for d in defined
-                       if not _LOCAL_VAR_RE.match(d) and not _ARG_VAR_RE.match(d)
-                       and not d.startswith('_') and len(d) > 1}
+            exports = {
+                d
+                for d in defined
+                if not _LOCAL_VAR_RE.match(d)
+                and not _ARG_VAR_RE.match(d)
+                and not d.startswith("_")
+                and len(d) > 1
+            }
             if exports:
                 file_defs[rel] = exports
                 for d in exports:
@@ -146,12 +267,12 @@ def compute_file_globals(decompiled_dir):
 
     for root, dirs, filenames in os.walk(decompiled_dir):
         for fn in sorted(filenames):
-            if not fn.endswith('.js'):
+            if not fn.endswith(".js"):
                 continue
             fp = os.path.join(root, fn)
-            rel = os.path.relpath(fp, decompiled_dir).replace('\\', '/')
+            rel = os.path.relpath(fp, decompiled_dir).replace("\\", "/")
             try:
-                with open(fp, encoding='utf-8', errors='replace') as f:
+                with open(fp, encoding="utf-8", errors="replace") as f:
                     content = f.read()
             except Exception:
                 continue
@@ -160,7 +281,7 @@ def compute_file_globals(decompiled_dir):
             all_ids = set()
             assigned_ids = set()
 
-            for m in re.finditer(r'\b([a-zA-Z_$][\w$]*)\b', code):
+            for m in re.finditer(r"\b([a-zA-Z_$][\w$]*)\b", code):
                 name = m.group(1)
                 if name in skip:
                     continue
@@ -168,38 +289,38 @@ def compute_file_globals(decompiled_dir):
                     continue
                 all_ids.add(name)
 
-            for m in re.finditer(r'\bvar\s+(\w+)', code):
+            for m in re.finditer(r"\bvar\s+(\w+)", code):
                 assigned_ids.add(m.group(1))
             var_declared = set()
-            for m in re.finditer(r'\bvar\s+(\w+)', code):
+            for m in re.finditer(r"\bvar\s+(\w+)", code):
                 var_declared.add(m.group(1))
-            for m in re.finditer(r'\bfunction\s*\*?\s+(\w+)', code):
+            for m in re.finditer(r"\bfunction\s*\*?\s+(\w+)", code):
                 var_declared.add(m.group(1))
-            for m in re.finditer(r'\b([a-zA-Z_$][\w$]*)\s*=', code):
-                after = code[m.end():m.end()+1] if m.end() < len(code) else ''
-                if after != '=':
+            for m in re.finditer(r"\b([a-zA-Z_$][\w$]*)\s*=", code):
+                after = code[m.end() : m.end() + 1] if m.end() < len(code) else ""
+                if after != "=":
                     assigned_ids.add(m.group(1))
-            for m in re.finditer(r'(\w+)\.prototype\.(\w+)\s*=', code):
+            for m in re.finditer(r"(\w+)\.prototype\.(\w+)\s*=", code):
                 assigned_ids.add(m.group(1))
-            for m in re.finditer(r'(\w+)\+\+', code):
+            for m in re.finditer(r"(\w+)\+\+", code):
                 assigned_ids.add(m.group(1))
-            for m in re.finditer(r'(\w+)--', code):
+            for m in re.finditer(r"(\w+)--", code):
                 assigned_ids.add(m.group(1))
-            for m in re.finditer(r'\+\+(\w+)', code):
+            for m in re.finditer(r"\+\+(\w+)", code):
                 assigned_ids.add(m.group(1))
-            for m in re.finditer(r'--(\w+)', code):
+            for m in re.finditer(r"--(\w+)", code):
                 assigned_ids.add(m.group(1))
-            for m in re.finditer(r'\bfor\s*\(\s*(\w+)\s+in\b', code):
+            for m in re.finditer(r"\bfor\s*\(\s*(\w+)\s+in\b", code):
                 assigned_ids.add(m.group(1))
-            for m in re.finditer(r'\bfor\s*\(\s*(\w+)\s+of\b', code):
+            for m in re.finditer(r"\bfor\s*\(\s*(\w+)\s+of\b", code):
                 assigned_ids.add(m.group(1))
 
             globals_dict = {}
             for name in all_ids:
                 if name in assigned_ids:
-                    globals_dict[name] = 'writable'
+                    globals_dict[name] = "writable"
                 else:
-                    globals_dict[name] = 'readonly'
+                    globals_dict[name] = "readonly"
             result[rel] = globals_dict
 
     return result
@@ -214,17 +335,17 @@ def inject_globals(decompiled_dir):
     total_globals = 0
     for root, dirs, filenames in os.walk(decompiled_dir):
         for fn in sorted(filenames):
-            if not fn.endswith('.js'):
+            if not fn.endswith(".js"):
                 continue
             fp = os.path.join(root, fn)
-            rel = os.path.relpath(fp, decompiled_dir).replace('\\', '/')
+            rel = os.path.relpath(fp, decompiled_dir).replace("\\", "/")
             try:
-                with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
             except Exception:
                 continue
 
-            has_old_header = content.startswith('/* global ')
+            has_old_header = content.startswith("/* global ")
             globals_dict = file_globals.get(rel, {})
 
             if not globals_dict and not has_old_header:
@@ -235,16 +356,16 @@ def inject_globals(decompiled_dir):
             if globals_dict:
                 parts = []
                 for name in sorted(globals_dict):
-                    if globals_dict[name] == 'writable':
-                        parts.append(name + ': writable')
+                    if globals_dict[name] == "writable":
+                        parts.append(name + ": writable")
                     else:
                         parts.append(name)
-                global_decl = '/* global ' + ', '.join(parts) + ' */\n'
+                global_decl = "/* global " + ", ".join(parts) + " */\n"
                 new_content = global_decl + content
             else:
                 new_content = content
 
-            with open(fp, 'w', encoding='utf-8') as f:
+            with open(fp, "w", encoding="utf-8") as f:
                 f.write(new_content)
             updated += 1
             total_globals += len(globals_dict)
@@ -253,13 +374,13 @@ def inject_globals(decompiled_dir):
 
 
 def _strip_old_header(content):
-    if content.startswith('/* global '):
-        nl = content.index('*/') + 2
-        if nl < len(content) and content[nl] == '\n':
+    if content.startswith("/* global "):
+        nl = content.index("*/") + 2
+        if nl < len(content) and content[nl] == "\n":
             nl += 1
         content = content[nl:]
-    if content.startswith('// References:'):
-        parts = content.split('\n// End References\n', 1)
+    if content.startswith("// References:"):
+        parts = content.split("\n// End References\n", 1)
         if len(parts) > 1:
             content = parts[1]
     return content
@@ -271,12 +392,12 @@ def find_missing_imports(decompiled_dir):
 
     for root, dirs, filenames in os.walk(decompiled_dir):
         for fn in sorted(filenames):
-            if not fn.endswith('.js'):
+            if not fn.endswith(".js"):
                 continue
             fp = os.path.join(root, fn)
-            rel = os.path.relpath(fp, decompiled_dir).replace('\\', '/')
+            rel = os.path.relpath(fp, decompiled_dir).replace("\\", "/")
             try:
-                with open(fp, encoding='utf-8', errors='replace') as f:
+                with open(fp, encoding="utf-8", errors="replace") as f:
                     content = f.read()
             except Exception:
                 continue
@@ -297,7 +418,7 @@ def find_missing_imports(decompiled_dir):
                     continue
                 if len(def_files) > 2:
                     continue
-                if re.match(r'^[a-z]{1,3}\d*$', name):
+                if re.match(r"^[a-z]{1,3}\d*$", name):
                     continue
                 needed.append((name, def_files))
 
@@ -323,13 +444,15 @@ def generate_imports(missing, decompiled_dir):
             if def_file in seen_files:
                 continue
             seen_files.add(def_file)
-            rel_path = os.path.relpath(def_file, cur_dir).replace('\\', '/')
-            if not rel_path.startswith('.'):
-                rel_path = './' + rel_path
-            names_str = ', '.join(sorted(set(names))[:5])
+            rel_path = os.path.relpath(def_file, cur_dir).replace("\\", "/")
+            if not rel_path.startswith("."):
+                rel_path = "./" + rel_path
+            names_str = ", ".join(sorted(set(names))[:5])
             if len(names) > 5:
-                names_str += ', ...'
-            lines.append('// require("{}")  // provides: {}'.format(rel_path, names_str))
+                names_str += ", ..."
+            lines.append(
+                '// require("{}")  // provides: {}'.format(rel_path, names_str)
+            )
 
         if lines:
             imports[rel] = lines
@@ -338,8 +461,8 @@ def generate_imports(missing, decompiled_dir):
 
 
 def _import_score(current, candidate):
-    cur_parts = current.split('/')
-    cand_parts = candidate.split('/')
+    cur_parts = current.split("/")
+    cand_parts = candidate.split("/")
     i = 0
     while i < min(len(cur_parts), len(cand_parts)) and cur_parts[i] == cand_parts[i]:
         i += 1
@@ -348,13 +471,17 @@ def _import_score(current, candidate):
 
 def cli_inject(decompiled_dir):
     updated, total = inject_globals(decompiled_dir)
-    print('Injected /* global ... */ into {} files ({} total globals)'.format(updated, total))
+    print(
+        "Injected /* global ... */ into {} files ({} total globals)".format(
+            updated, total
+        )
+    )
 
 
 def cli_show_missing(decompiled_dir):
     missing, file_defs, global_to_files = find_missing_imports(decompiled_dir)
     imports = generate_imports(missing, decompiled_dir)
     for rel, lines in sorted(imports.items())[:20]:
-        print('\n## {}'.format(rel))
+        print("\n## {}".format(rel))
         for line in lines:
-            print('  {}'.format(line))
+            print("  {}".format(line))

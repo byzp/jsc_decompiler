@@ -3,6 +3,7 @@
 Objects are laid out flat in the file: parent, then its children, then next sibling.
 Returns a list of DisasmFunc objects — no decompiler dependency.
 """
+
 import struct
 from ..utils import u32le
 from ..codegen import parse_code
@@ -23,7 +24,7 @@ def _find_code_start(d, fields_end, codelen, nsrc_f, natoms_f):
         for _ in range(natoms_f + 4):
             if temp + 4 > len(d):
                 break
-            raw = struct.unpack_from('<I', d, temp)[0]
+            raw = struct.unpack_from("<I", d, temp)[0]
             if raw == 0:
                 temp += 4
                 continue
@@ -33,14 +34,18 @@ def _find_code_start(d, fields_end, codelen, nsrc_f, natoms_f):
                 break
             temp += 4
             if is_lat:
-                if not all(32 <= b < 127 or b in (9, 10, 13) for b in d[temp:temp + length]):
+                if not all(
+                    32 <= b < 127 or b in (9, 10, 13) for b in d[temp : temp + length]
+                ):
                     break
                 temp += length
             else:
                 sz = length * 2
                 try:
-                    s = d[temp:temp + sz].decode('utf-16le')
-                    if not s or not all(ch in '\t\r\n' or 32 <= ord(ch) <= 0x9fff for ch in s):
+                    s = d[temp : temp + sz].decode("utf-16le")
+                    if not s or not all(
+                        ch in "\t\r\n" or 32 <= ord(ch) <= 0x9FFF for ch in s
+                    ):
                         break
                 except UnicodeDecodeError:
                     break
@@ -69,19 +74,19 @@ def _parse_var_slots(d, fields_end, code_start):
             break
         if vs_off + 4 > len(d):
             break
-        raw = struct.unpack_from('<I', d, vs_off)[0]
+        raw = struct.unpack_from("<I", d, vs_off)[0]
         if raw == 0:
-            var_slot_names.append('')
+            var_slot_names.append("")
             vs_off += 4
             continue
         is_lat = raw & 1
         length = raw >> 1
         if is_lat and length == 0:
-            var_slot_names.append('')
+            var_slot_names.append("")
             vs_off += 4
             continue
         if not is_lat:
-            var_slot_names.append('')
+            var_slot_names.append("")
             vs_off += 4
             continue
         if length == 0 or length > 50:
@@ -99,27 +104,27 @@ def _parse_consts_at(d, o, nconst_f):
     for _ in range(nconst_f):
         if o + 4 > len(d):
             break
-        type_tag = struct.unpack_from('<I', d, o)[0]
+        type_tag = struct.unpack_from("<I", d, o)[0]
         o += 4
         if type_tag == 0 and o + 4 <= len(d):
-            consts.append(('int', struct.unpack_from('<I', d, o)[0]))
+            consts.append(("int", struct.unpack_from("<I", d, o)[0]))
             o += 4
         elif type_tag == 1 and o + 8 <= len(d):
-            consts.append(('double', struct.unpack('<d', d[o:o + 8])[0]))
+            consts.append(("double", struct.unpack("<d", d[o : o + 8])[0]))
             o += 8
         elif type_tag == 2:
             s, o = parse_atom(d, o)
-            consts.append(('atom', s))
+            consts.append(("atom", s))
         elif type_tag == 3:
-            consts.append(('bool', True))
+            consts.append(("bool", True))
         elif type_tag == 4:
-            consts.append(('bool', False))
+            consts.append(("bool", False))
         elif type_tag == 5:
-            consts.append(('null', None))
+            consts.append(("null", None))
         elif type_tag == 7:
-            consts.append(('void', None))
+            consts.append(("void", None))
         else:
-            consts.append(('unknown', type_tag))
+            consts.append(("unknown", type_tag))
     return consts, o
 
 
@@ -136,7 +141,7 @@ def parse_objects(data, start_off, nobj):
     while obj_idx < nobj:
         sentinel_pos = None
         for s in range(o, min(o + 64, len(d) - 4)):
-            if struct.unpack_from('<I', d, s)[0] == 0xFFFFFFFF:
+            if struct.unpack_from("<I", d, s)[0] == 0xFFFFFFFF:
                 sentinel_pos = s
                 break
         if sentinel_pos is None:
@@ -149,7 +154,7 @@ def parse_objects(data, start_off, nobj):
         has_atom = firstWord & 1
         o += 4
 
-        atom_name = ''
+        atom_name = ""
         if has_atom:
             atom_name, o = parse_atom(d, o)
 
@@ -172,7 +177,9 @@ def parse_objects(data, start_off, nobj):
             obj_idx += 1
             continue
 
-        code_start, code_end, atom_start, best_count = _find_code_start(d, o, codelen, nsrc_f, natoms_f)
+        code_start, code_end, atom_start, best_count = _find_code_start(
+            d, o, codelen, nsrc_f, natoms_f
+        )
         var_slot_names = _parse_var_slots(d, o, code_start)
 
         nargs = (fields[0] >> 16) & 0xFFFF

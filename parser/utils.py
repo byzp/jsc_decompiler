@@ -1,4 +1,5 @@
 """Shared binary I/O helpers."""
+
 import struct
 
 
@@ -17,11 +18,11 @@ def r_be(d, o, s):
 
 
 def u32le(d, o):
-    return struct.unpack_from('<I', d, o)[0]
+    return struct.unpack_from("<I", d, o)[0]
 
 
 def s32(v):
-    return struct.unpack('<i', struct.pack('<I', v & 0xFFFFFFFF))[0]
+    return struct.unpack("<i", struct.pack("<I", v & 0xFFFFFFFF))[0]
 
 
 def s8(v):
