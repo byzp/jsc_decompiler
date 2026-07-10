@@ -1,12 +1,10 @@
-"""Opcode table from libCakeMania.so binary (Cocos2d-x custom MozJS build).
+"""Opcode table for MozJS34 / Cocos51 bytecode.
 
-Extracted from js_opcode_str[] (names) and js_CodeSpec (lengths/use/def)
-from the .rodata section of the binary.
+Extracted from libCakeMania.so binary (Cocos2d-x custom MozJS build).
+Shared by all parser versions that use the same opcode encoding.
 """
-import os
 from ._codespec import CODESPEC
 
-# Binary opcode names (230 entries, 0x00-0xE5)
 _BINARY_NAMES = {
     0x00:'nop',0x01:'undefined',0x02:'popv',0x03:'enterwith',0x04:'leavewith',
     0x05:'return',0x06:'goto',0x07:'ifeq',0x08:'ifne',0x09:'arguments',
@@ -65,8 +63,6 @@ _BINARY_NAMES = {
     0xE3:'loopentry',0xE4:'notearg',0xE5:'proxy',
 }
 
-# Lengths inferred from standard MozJS34 equivalents + semantic analysis
-_BINARY_LENGTHS = {}
 _IDX_NAMES = frozenset({
     'name','bindname','setname','getprop','setprop','callprop','string',
     'implicitthis','callname','defvar','defconst','delname','delprop',
@@ -86,125 +82,64 @@ _CALL_NAMES = frozenset({'call','new','funcall','eval','funapply'})
 _ARG_NAMES = frozenset({'getarg','setarg','callarg','incarg','decarg','arginc','argdec'})
 _LOCAL_NAMES = frozenset({'getlocal','setlocal','calllocal','inclocal','declocal','localinc','localdec'})
 
-def _get_default_len(name):
-    """Return (length, use, push) for a binary opcode name."""
-    ln = 1
-    use = 0
-    push = 0
 
-    if name in _IDX_NAMES:
-        ln = 5; push = 1
-    elif name in _ALIASED_NAMES:
-        ln = 5; push = 1
+def _get_default_len(name):
+    ln = 1; use = 0; push = 0
+    if name in _IDX_NAMES:       ln = 5; push = 1
+    elif name in _ALIASED_NAMES: ln = 5; push = 1
     elif name in _JUMP_NAMES:
         ln = 5
-        if name not in ('label','gosub','backpatch'):
-            use = 1; push = 1
-    elif name in _CALL_NAMES:
-        ln = 3
-        use = -1; push = 1
-    elif name in _ARG_NAMES:
-        ln = 3; push = 1
-    elif name in _LOCAL_NAMES:
-        ln = 4; push = 1
-    elif name == 'tableswitch':
-        ln = -1; use = 1
-    elif name == 'uint16':
-        ln = 3; push = 1
-    elif name == 'uint24':
-        ln = 4; push = 1
-    elif name == 'int8':
-        ln = 2; push = 1
-    elif name == 'int32':
-        ln = 5; push = 1
-    elif name == 'popn':
-        ln = 3; use = -1
-    elif name == 'pick':
-        ln = 2
-    elif name in ('pop','popv'):
-        ln = 1; use = 1
-    elif name == 'dup':
-        ln = 1; use = 1; push = 2
-    elif name == 'dup2':
-        ln = 1; use = 2; push = 4
-    elif name == 'swap':
-        ln = 1; use = 2; push = 2
-    elif name == 'newinit':
-        ln = 5; push = 1
-    elif name == 'newarray':
-        ln = 4; push = 1
-    elif name == 'initelem_array':
-        ln = 4
-    elif name == 'enumconstelem':
-        ln = 4
-    elif name == 'iter':
-        ln = 2; use = 1; push = 1
-    elif name == 'loopentry':
-        ln = 2
-    elif name in ('lineno',):
-        ln = 3
-
-    # Literals
-    elif name in ('undefined','zero','one','null','this','false','true'):
-        push = 1
-    elif name == 'notearg':
-        pass  # no-op
-    elif name == 'callee':
-        push = 1
-    elif name == 'hole':
-        push = 1
-    elif name == 'stop':
-        pass
-    elif name in ('typeof','typeofexpr'):
-        use = 1; push = 1
-    elif name == 'void':
-        use = 1; push = 1
-    elif name == 'neg':
-        use = 1; push = 1
-
-    # Binary/unary ops
+        if name not in ('label','gosub','backpatch'): use = 1; push = 1
+    elif name in _CALL_NAMES:    ln = 3; use = -1; push = 1
+    elif name in _ARG_NAMES:     ln = 3; push = 1
+    elif name in _LOCAL_NAMES:   ln = 4; push = 1
+    elif name == 'tableswitch':  ln = -1; use = 1
+    elif name == 'uint16':       ln = 3; push = 1
+    elif name == 'uint24':       ln = 4; push = 1
+    elif name == 'int8':         ln = 2; push = 1
+    elif name == 'int32':        ln = 5; push = 1
+    elif name == 'popn':         ln = 3; use = -1
+    elif name == 'pick':         ln = 2
+    elif name in ('pop','popv'): ln = 1; use = 1
+    elif name == 'dup':          ln = 1; use = 1; push = 2
+    elif name == 'dup2':         ln = 1; use = 2; push = 4
+    elif name == 'swap':         ln = 1; use = 2; push = 2
+    elif name == 'newinit':      ln = 5; push = 1
+    elif name == 'newarray':     ln = 4; push = 1
+    elif name == 'initelem_array': ln = 4
+    elif name == 'enumconstelem': ln = 4
+    elif name == 'iter':         ln = 2; use = 1; push = 1
+    elif name == 'loopentry':    ln = 2
+    elif name in ('lineno',):    ln = 3
+    elif name in ('undefined','zero','one','null','this','false','true'): push = 1
+    elif name == 'notearg':      pass
+    elif name == 'callee':       push = 1
+    elif name == 'hole':         push = 1
+    elif name == 'stop':         pass
+    elif name in ('typeof','typeofexpr'): use = 1; push = 1
+    elif name == 'void':         use = 1; push = 1
+    elif name == 'neg':          use = 1; push = 1
     elif name in ('add','sub','mul','div','mod','bitor','bitxor','bitand',
                   'lsh','rsh','ursh','eq','ne','lt','le','gt','ge',
-                  'stricteq','strictne','in','instanceof'):
-        use = 2; push = 1
-    elif name in ('not','bitnot'):
-        use = 1; push = 1
-
-    # Set/elem ops
-    elif name in ('setprop','initprop','setgname','setintrinsic','getter','setter'):
-        use = 2; push = 1
-    elif name in ('setelem',):
-        use = 3; push = 1
-    elif name in ('getprop','callprop','callelem','getelem','enumelem','getgname','getintrinsic','callgname','callintrinsic'):
-        use = 1; push = 1
-    elif name == 'length':
-        use = 1; push = 1
-
-    # Other
-    elif name == 'rest':
-        push = 1
-    elif name == 'arguments':
-        push = 1
-    elif name in ('setrval','throwing'):
-        use = 1
-    elif name == 'yield':
-        use = 1; push = 1
-    elif name == 'throw':
-        use = 1
-    elif name == 'arraypush':
-        use = 2
-    elif name == 'finally':
-        push = 2
-    elif name == 'exception':
-        push = 1
-    elif name == 'spread':
-        use = 3; push = 1
-
+                  'stricteq','strictne','in','instanceof'): use = 2; push = 1
+    elif name in ('not','bitnot'): use = 1; push = 1
+    elif name in ('setprop','initprop','setgname','setintrinsic','getter','setter'): use = 2; push = 1
+    elif name in ('setelem',):   use = 3; push = 1
+    elif name in ('getprop','callprop','callelem','getelem','enumelem','getgname','getintrinsic','callgname','callintrinsic'): use = 1; push = 1
+    elif name == 'length':       use = 1; push = 1
+    elif name == 'rest':         push = 1
+    elif name == 'arguments':    push = 1
+    elif name in ('setrval','throwing'): use = 1
+    elif name == 'yield':        use = 1; push = 1
+    elif name == 'throw':        use = 1
+    elif name == 'arraypush':    use = 2
+    elif name == 'finally':      push = 2
+    elif name == 'exception':    push = 1
+    elif name == 'spread':       use = 3; push = 1
     return (ln, use, push)
 
 
 def build_table():
-    """Fill JSOP table from binary names + CodeSpec."""
     global JSOP
     for oc in range(0xE6):
         name = _BINARY_NAMES.get(oc, f'unused{oc}')
@@ -212,13 +147,7 @@ def build_table():
             ln, use, push, prec, fmt = CODESPEC[oc]
         else:
             ln, use, push = 1, 0, 0
-        JSOP[oc] = {
-            'name': name,
-            'image': None,
-            'length': ln,
-            'use': use,
-            'push': push,
-        }
+        JSOP[oc] = {'name': name, 'image': None, 'length': ln, 'use': use, 'push': push}
 
 
 JSOP = {}
@@ -236,7 +165,6 @@ IMAGE_OPS = {
     'lsh': '<<', 'rsh': '>>', 'ursh': '>>>',
     'eq': '==', 'ne': '!=', 'lt': '<', 'le': '<=',
     'gt': '>', 'ge': '>=', 'stricteq': '===', 'strictne': '!==',
-    'not': '!', 'bitnot': '~', 'neg': '-',
 }
 
 NOOP_NAMES = frozenset({
@@ -251,18 +179,10 @@ NOOP_NAMES = frozenset({
 
 
 def get_op_info(op_byte, is_cocos=False):
-    """Return {'name', 'length', 'use', 'push'} for a raw opcode byte."""
     info = JSOP.get(op_byte)
     if info:
         return info
-    # Infer unknown opcodes as length 1 no-op
-    return {
-        'name': f'unk_{op_byte:02x}',
-        'image': None,
-        'length': 1,
-        'use': 0,
-        'push': 0,
-    }
+    return {'name': f'unk_{op_byte:02x}', 'image': None, 'length': 1, 'use': 0, 'push': 0}
 
 
 build_table()
