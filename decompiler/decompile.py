@@ -166,9 +166,16 @@ class DecompileEngine:
 
         In MozJS34, hops=0 means the CURRENT function's own scope (aliased vars
         are locals that have been captured by closures). hops=1 means the
-        enclosing scope, hops=2 means two levels up, etc.
+        enclosing scope (parent), hops=2 means two levels up, etc.
+
+        Slot numbering: In SpiderMonkey 34, the slot in ScopeCoordinate indexes
+        into the CallObject's dynamic slots, which start after RESERVED_SLOTS
+        (2 slots: callee + enclosingScope). So the mapping is:
+          var_slot_names_index = slot - RESERVED_SLOTS(2)
+        For Cocos51, the 2+2 encoding already contains the correct var index
+        (no offset needed), so we only apply the offset for MozJS34.
         """
-        scope = self._parent_func
+        scope = self.d
         for _ in range(hops):
             if scope is None:
                 break
@@ -176,19 +183,32 @@ class DecompileEngine:
             scope = parent
         if scope is None:
             scope = self.d
-        lv = self._local_vars.get(slot) if scope is self.d else None
-        if lv:
-            return lv.name
-        if slot < len(scope.var_slot_names):
-            return scope.var_slot_names[slot]
-        if slot < len(scope.argvs):
-            return scope.argvs[slot]
+
+        # MozJS34 CallObject slot offset (RESERVED_SLOTS = 2)
+        if not scope.is_cocos:
+            var_idx = slot - 2
+        else:
+            var_idx = slot
+
+        # Try local_vars first (only for current scope)
+        if scope is self.d:
+            lv = self._local_vars.get(var_idx)
+            if lv:
+                return lv.name
+
+        # Map to var_slot_names
+        if 0 <= var_idx < len(scope.var_slot_names):
+            return scope.var_slot_names[var_idx]
+
+        # Fallback: search parent scopes
         parent = getattr(scope, "_parent_func", None)
         while parent is not None:
-            if slot < len(parent.var_slot_names):
-                return parent.var_slot_names[slot]
-            if slot < len(parent.argvs):
-                return parent.argvs[slot]
+            if not parent.is_cocos:
+                pidx = slot - 2
+            else:
+                pidx = slot
+            if 0 <= pidx < len(parent.var_slot_names):
+                return parent.var_slot_names[pidx]
             parent = getattr(parent, "_parent_func", None)
         return f"l{slot}"
 
@@ -788,7 +808,21 @@ class DecompileEngine:
             self._push(name="...rest")
 
         # aliased vars
-        elif nm in ("getaliasedvar", "callaliasedvar"):
+        # Note: in standard MozJS34 bytecode, JSOP_CALLALIASEDVAR (0x89) has
+        # the same stack effect as SETALIASEDVAR (use=1, push=1): it pops the
+        # top of stack and assigns it to the aliased variable slot. The CALL
+        # prefix is a type-inference hint only. Cocos51 never emits this opcode
+        # (it uses SETALIASEDVAR directly), so treating CALLALIASEDVAR as
+        # SETALIASEDVAR is safe for both formats.
+        elif nm == "callaliasedvar":
+            val = self._pop()
+            var_name = self._resolve_aliased_var(p.get("hops", 0), p.get("slot", 0))
+            if not var_name:
+                var_name = f'_av{p.get("slot", 0)}'
+            self._push(
+                tp="script", name=var_name, script=f"{var_name}={val.get_value()}"
+            )
+        elif nm == "getaliasedvar":
             var_name = self._resolve_aliased_var(p.get("hops", 0), p.get("slot", 0))
             if not var_name:
                 var_name = f'_av{p.get("slot", 0)}'

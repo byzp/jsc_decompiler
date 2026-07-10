@@ -6,14 +6,14 @@ nested object parsing. Returns DisasmFunc — no decompiler dependency.
 
 import struct
 from ..utils import u32le
-from ..codegen import parse_code
+from .codegen import parse_code
 from disasm import DisasmFunc
 
 
 def parse(data):
     func, code_start, code_end = _parse_header(data)
     if func.codelen > 0:
-        func.ops = parse_code(data, code_start, code_end, is_cocos=True)
+        func.ops = parse_code(data, code_start, code_end)
     _parse_atoms(data, func, code_end)
     if func.nobj > 0:
         try:
@@ -296,7 +296,7 @@ def _parse_objects(data, start_off, nobj):
         func.is_cocos = True
 
         if codelen > 0:
-            func.ops = parse_code(d, code_start, code_start + codelen, is_cocos=True)
+            func.ops = parse_code(d, code_start, code_start + codelen)
 
         nsrc = func.nsrc
         search_start = max(code_start + codelen, code_start + codelen + nsrc - 30)

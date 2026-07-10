@@ -1,117 +1,22 @@
-"""Bytecode stream decoder: opcode identification + operand extraction.
+"""Standard MozJS34 (0xB973C02C) bytecode stream decoder.
 
-Shared by all MozJS34-based parser versions (cocos51, mozjs34).
-Returns a list of op dicts instead of mutating a decompiler object.
+Aliased var encoding: hops=1byte + slot=3bytes (big-endian), length=5.
 """
 
 import struct
 from .opcodes import get_op_info
-from .utils import r_be, s32, s8
-
-_JUMP_NAMES = frozenset(
-    {
-        "goto",
-        "ifeq",
-        "ifne",
-        "or",
-        "and",
-        "label",
-        "case",
-        "default",
-        "gosub",
-        "backpatch",
-    }
+from ..opcodes import (
+    _JUMP_NAMES,
+    _CALL_NAMES,
+    _IDX_NAMES,
+    _ALIASED_NAMES,
+    _ARG_NAMES,
+    _LOCAL_NAMES,
 )
-_CALL_NAMES = frozenset({"call", "new", "funcall", "eval", "funapply"})
-_IDX_NAMES = frozenset(
-    {
-        "name",
-        "bindname",
-        "setname",
-        "getprop",
-        "setprop",
-        "callprop",
-        "string",
-        "implicitthis",
-        "callname",
-        "defvar",
-        "defconst",
-        "delname",
-        "delprop",
-        "getgname",
-        "setgname",
-        "bindgname",
-        "initprop",
-        "getintrinsic",
-        "setintrinsic",
-        "bindintrinsic",
-        "callintrinsic",
-        "callgname",
-        "deffun",
-        "lambda",
-        "newobject",
-        "object",
-        "regexp",
-        "setconst",
-        "double",
-        "getter",
-        "setter",
-        "getxprop",
-        "getfunns",
-        "length",
-        "incname",
-        "decname",
-        "nameinc",
-        "namedec",
-        "incprop",
-        "decprop",
-        "propinc",
-        "propdec",
-        "incgname",
-        "decgname",
-        "gnameinc",
-        "gnamedec",
-        "incarg",
-        "decarg",
-        "arginc",
-        "argdec",
-        "inclocal",
-        "declocal",
-        "localinc",
-        "localdec",
-        "enterlet0",
-        "enterlet1",
-        "enterblock",
-    }
-)
-_ALIASED_NAMES = frozenset(
-    {
-        "getaliasedvar",
-        "setaliasedvar",
-        "callaliasedvar",
-        "incaliasedvar",
-        "decaiasedvar",
-        "aliasedvarinc",
-        "aliasedvardec",
-    }
-)
-_ARG_NAMES = frozenset(
-    {"getarg", "setarg", "callarg", "incarg", "decarg", "arginc", "argdec"}
-)
-_LOCAL_NAMES = frozenset(
-    {
-        "getlocal",
-        "setlocal",
-        "calllocal",
-        "inclocal",
-        "declocal",
-        "localinc",
-        "localdec",
-    }
-)
+from ..utils import r_be, s32, s8
 
 
-def parse_code(data, code_start, code_end, is_cocos=False):
+def parse_code(data, code_start, code_end):
     ops = []
     o = code_start
     end = min(code_end, len(data))
@@ -120,7 +25,7 @@ def parse_code(data, code_start, code_end, is_cocos=False):
     max_target = o
     while o < end and op_count < max_ops:
         op_byte = data[o]
-        info = get_op_info(op_byte, is_cocos)
+        info = get_op_info(op_byte)
         nm = info["name"]
         ol = info["length"]
         params = _extract_params(data, o, nm, ol)
@@ -135,7 +40,7 @@ def parse_code(data, code_start, code_end, is_cocos=False):
     if max_target > code_end and max_target < len(data):
         while o < max_target and op_count < max_ops:
             op_byte = data[o]
-            info = get_op_info(op_byte, is_cocos)
+            info = get_op_info(op_byte)
             nm = info["name"]
             ol = info["length"]
             if ol == 255 or ol <= 0:
@@ -161,8 +66,9 @@ def _extract_params(d, o, nm, ol):
         elif nm in _IDX_NAMES and p + 4 <= len(d):
             params["idx"] = r_be(d, p, 4)[0]
         elif nm in _ALIASED_NAMES and p + 4 <= len(d):
-            params["hops"] = (d[p] << 8) | d[p + 1]
-            params["slot"] = (d[p + 2] << 8) | d[p + 3]
+            # MozJS34: hops=1byte + slot=3bytes (big-endian)
+            params["hops"] = d[p]
+            params["slot"] = (d[p + 1] << 16) | (d[p + 2] << 8) | d[p + 3]
         elif nm == "tableswitch" and p + 12 <= len(d):
             params["len"] = s32(r_be(d, p, 4)[0])
             params["low"] = s32(r_be(d, p + 4, 4)[0])
