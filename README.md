@@ -8,7 +8,7 @@ Cocos2d-x JSC 字节码反汇编和反编译器
 # 不知道啥版本
 0xB973C051
 
-# MozJS34
+# spider-monkey version 33
 0xB973C02C
 ```
 

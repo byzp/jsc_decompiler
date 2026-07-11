@@ -75,7 +75,7 @@ def parse_code(data, code_start, code_end):
     ops = []
     o = code_start
     end = min(code_end, len(data))
-    max_ops = 50000
+    max_ops = 5000000
     op_count = 0
     while o < end and op_count < max_ops:
         op_byte = data[o]
