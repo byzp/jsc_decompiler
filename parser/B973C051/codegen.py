@@ -15,6 +15,39 @@ from ..opcodes import (
 )
 from ..utils import r_be, s32, s8
 
+_INC_DEC_NAMES = frozenset(
+    {
+        "incarg",
+        "decarg",
+        "arginc",
+        "argdec",
+        "inclocal",
+        "declocal",
+        "localinc",
+        "localdec",
+        "incaliasedvar",
+        "decaiasedvar",
+        "aliasedvarinc",
+        "aliasedvardec",
+        "incname",
+        "decname",
+        "nameinc",
+        "namedec",
+        "incgname",
+        "decgname",
+        "gnameinc",
+        "gnamedec",
+        "incprop",
+        "decprop",
+        "propinc",
+        "propdec",
+        "incelem",
+        "decelem",
+        "eleminc",
+        "elemdec",
+    }
+)
+
 
 def parse_code(data, code_start, code_end):
     ops = []
@@ -35,6 +68,8 @@ def parse_code(data, code_start, code_end):
             tgt = o + ol + params["offset"]
             max_target = max(max_target, tgt)
         ops.append({"off": o, "nm": nm, "params": params, "len": ol})
+        if nm in _INC_DEC_NAMES:
+            ops.append({"off": o, "nm": "pop", "params": {}, "len": 0})
         o += ol
         op_count += 1
     if max_target > code_end and max_target < len(data):

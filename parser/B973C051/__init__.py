@@ -20,6 +20,9 @@ def parse(data):
             atoms_end = _find_atoms_end(data, func, code_end)
             consts_end = _find_consts_end(data, func, atoms_end)
             func.children = _parse_objects(data, consts_end, func.nobj)
+            for _ch in func.children:
+                if _ch is not None:
+                    _ch.parent = func
         except Exception:
             pass
     return func
@@ -364,6 +367,9 @@ def _parse_objects(data, start_off, nobj):
 
         if nobjects_f > 0:
             func.children = _parse_objects(d, sub_off, nobjects_f)
+            for _ch in func.children:
+                if _ch is not None:
+                    _ch.parent = func
 
         objects.append(func)
         o = code_start + codelen

@@ -163,14 +163,24 @@ def _xdr_script(s, is_top_level=False):
     var_names = []
     for _ in range(name_count):
         var_names.append(s.atom())
-    # Skip u8 alias/padding bytes (one per name)
-    s.pos += name_count
+    # One u8 per binding: bit0 = aliased (captured by inner closure, lives in
+    # CallObject); bits1+ = BindingKind (0=FORMAL, 1=VAR, 2=CONST, 3=INTERNAL).
+    # A function with any aliased binding materializes a scope object, which is
+    # what the getaliasedvar/setaliasedvar `hops` count traverses.
+    aliased_flags = []
+    for _ in range(name_count):
+        if s.pos < len(s.data):
+            aliased_flags.append(bool(s.u8() & 1))
+        else:
+            aliased_flags.append(False)
 
     # Populate argvs and var_slot_names
     argvs = var_names[:nargs] if nargs > 0 else []
     var_slot_names = var_names if var_names else []
     func.argvs = argvs
     func.var_slot_names = var_slot_names
+    func.aliased_flags = aliased_flags
+    func.aliased_slot_offset = 2
 
     # ── Sub-header (only for non-top-level, if present) ──
     # For nested scripts, after var names there may be:
@@ -221,6 +231,8 @@ def _xdr_script(s, is_top_level=False):
     children = []
     for _ in range(nobj):
         child = _xdr_object(s)
+        if child is not None:
+            child.parent = func
         children.append(child)  # may be None for non-JSFunction
     func.children = children
 
@@ -376,7 +388,7 @@ def _xdr_block_object(s):
     s.u32()  # offset
     for _ in range(count):
         s.atom()  # atom
-        s.u8()  # aliased
+        s.u32()  # aliased
 
 
 def _xdr_js_function(s):

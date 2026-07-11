@@ -366,7 +366,6 @@ NOOP_NAMES = frozenset(
         "lineno",
         "label",
         "backpatch",
-        "pos",
         "setcall",
         "callee",
         "gosub",

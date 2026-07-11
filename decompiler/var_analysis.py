@@ -149,7 +149,7 @@ _JS_BUILTINS = frozenset(
     }
 )
 
-_LOCAL_VAR_RE = re.compile(r"^[lv](_?\d+)$")
+_LOCAL_VAR_RE = re.compile(r"^([lv]_?\d+|_var_\d+|_[a-z][a-zA-Z0-9]*)$")
 _ARG_VAR_RE = re.compile(r"^a\d+$")
 
 
@@ -319,8 +319,11 @@ def compute_file_globals(decompiled_dir):
             for name in all_ids:
                 if name in assigned_ids:
                     globals_dict[name] = "writable"
-                else:
+                elif name not in skip:
                     globals_dict[name] = "readonly"
+            for name in assigned_ids:
+                if name in skip and name not in globals_dict:
+                    globals_dict[name] = "writable"
             result[rel] = globals_dict
 
     return result

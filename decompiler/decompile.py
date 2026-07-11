@@ -20,6 +20,30 @@ def _js_str(s):
     return json.dumps(s, ensure_ascii=True)
 
 
+def _infer_var_name(val, slot, var_slot_names):
+    if slot < len(var_slot_names):
+        vsn = var_slot_names[slot]
+        if vsn:
+            return vsn
+    return f"_var_{slot}"
+
+
+def _camel_from_dotted(dotted):
+    """Convert dotted name to camelCase: ty._TCPConnection → tyTcpConnection."""
+    parts = dotted.split(".")
+    result = []
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        if part.startswith("_"):
+            part = part[1:]
+        if i == 0:
+            result.append(part[0].lower() + part[1:] if part else part)
+        else:
+            result.append(part[0].upper() + part[1:] if part else part)
+    return "".join(result) or "v"
+
+
 class DecompileEngine:
     def __init__(self, func, parent_func=None, dump_bytecode=False):
         self.d = func
@@ -28,6 +52,7 @@ class DecompileEngine:
         self._parent_func = parent_func
         self._dump_bytecode = dump_bytecode
         self._local_vars = {}
+        self._assigned_local_slots = set()
         self._stack = []
         self.script = {}
         self.logic_stacks = {}
@@ -42,6 +67,10 @@ class DecompileEngine:
             False  # inside catch block (between exception and finally/leaveblock)
         )
         self._catch_closed = False  # catch block's } already emitted by leaveblock
+        self._just_closed_switch = False  # True right after default: closes a switch
+        self._skip_next_pop = (
+            False  # True to suppress synthetic pop after skipped inc/dec
+        )
         self._switch_labels = {}  # target_offset → 'case val:' / 'default:'
         self._switch_stack = (
             []
@@ -145,8 +174,10 @@ class DecompileEngine:
         for op in self.d.ops:
             try:
                 self._dispatch(op)
-            except Exception:
-                pass
+            except Exception as e:
+                nm = op.get("nm", "?")
+                off = op.get("off", 0)
+                self._w(off, f"/* unhandled opcode: {nm} at 0x{off:04x} — {e} */")
         # Close any remaining open blocks at function end
         close_count = len(self._open_ifs) + self._block_depth
         if close_count > 0:
@@ -162,55 +193,53 @@ class DecompileEngine:
         return self._stack.pop() if self._stack else StackItem()
 
     def _resolve_aliased_var(self, hops, slot):
-        """Resolve aliased var (hops+slot) to variable name from scope chain.
+        """Resolve an aliased var (hops, slot) to a variable name.
 
-        In MozJS34, hops=0 means the CURRENT function's own scope (aliased vars
-        are locals that have been captured by closures). hops=1 means the
-        enclosing scope (parent), hops=2 means two levels up, etc.
-
-        Slot numbering: In SpiderMonkey 34, the slot in ScopeCoordinate indexes
-        into the CallObject's dynamic slots, which start after RESERVED_SLOTS
-        (2 slots: callee + enclosingScope). So the mapping is:
-          var_slot_names_index = slot - RESERVED_SLOTS(2)
-        For Cocos51, the 2+2 encoding already contains the correct var index
-        (no offset needed), so we only apply the offset for MozJS34.
+        Aliased vars are bindings captured by inner closures.  At runtime they
+        live in a scope object (CallObject) that a function materializes iff it
+        has any aliased binding.  ``hops`` counts those scope objects up the
+        static scope chain; functions without captured bindings are transparent
+        and skipped.  ``slot`` indexes the CallObject's dynamic slots, which
+        begin after RESERVED_SLOTS (2: callee + enclosingScope) in MozJS34,
+        so the binding index into ``var_slot_names`` is
+        ``slot - aliased_slot_offset``.  Cocos51 uses direct indexing (offset=0).
         """
-        scope = self.d
-        for _ in range(hops):
-            if scope is None:
-                break
-            parent = getattr(scope, "_parent_func", None)
-            scope = parent
-        if scope is None:
-            scope = self.d
+        chain = []
+        f = self.d
+        while f is not None:
+            flags = getattr(f, "aliased_flags", None)
+            if flags and any(flags):
+                chain.append(f)
+            f = getattr(f, "parent", None)
 
-        # MozJS34 CallObject slot offset (RESERVED_SLOTS = 2)
-        if not scope.is_cocos:
-            var_idx = slot - 2
+        if hops < len(chain):
+            target = chain[hops]
+        elif chain:
+            target = chain[-1]
         else:
-            var_idx = slot
+            target = self.d
 
-        # Try local_vars first (only for current scope)
-        if scope is self.d:
+        offset = getattr(target, "aliased_slot_offset", 0)
+        var_idx = slot - offset
+
+        if target is self.d and var_idx >= 0:
             lv = self._local_vars.get(var_idx)
-            if lv:
+            if lv and lv.name:
                 return lv.name
 
-        # Map to var_slot_names
-        if 0 <= var_idx < len(scope.var_slot_names):
-            return scope.var_slot_names[var_idx]
+        if 0 <= var_idx < len(target.var_slot_names):
+            nm = target.var_slot_names[var_idx]
+            if nm:
+                return nm
 
-        # Fallback: search parent scopes
-        parent = getattr(scope, "_parent_func", None)
+        parent = getattr(target, "parent", None)
         while parent is not None:
-            if not parent.is_cocos:
-                pidx = slot - 2
-            else:
-                pidx = slot
-            if 0 <= pidx < len(parent.var_slot_names):
-                return parent.var_slot_names[pidx]
-            parent = getattr(parent, "_parent_func", None)
-        return f"l{slot}"
+            p_offset = getattr(parent, "aliased_slot_offset", 0)
+            p_idx = slot - p_offset
+            if 0 <= p_idx < len(parent.var_slot_names):
+                return parent.var_slot_names[p_idx]
+            parent = getattr(parent, "parent", None)
+        return f"_var_{slot}"
 
     def _negate_condition(self, cond):
         """Negate a condition for ifeq (which jumps when true, so we need the negated form).
@@ -349,30 +378,36 @@ class DecompileEngine:
         p = op["params"]
         o = op["off"]
 
+        if nm != "goto":
+            self._just_closed_switch = False
+
         # Check for pending switch case/default labels at this offset first
         # (before closing if-blocks, so default: comes before })
         if o in self._switch_labels:
             labels = self._switch_labels[o]
             has_default = any(lb == "default:" for lb in labels)
             if has_default:
-                # Close if-blocks from previous case before default
-                if self._in_switch:
+                switch_bd = self._switch_stack[-1][4] if self._switch_stack else 0
+                if not self._in_switch or self._block_depth < switch_bd:
+                    self._switch_labels.pop(o, None)
+                else:
+                    # Close if-blocks from previous case before default
                     new_ifs = len(self._open_ifs) - self._switch_ifs_start
                     if new_ifs > 0:
                         self._w(o, "}" * new_ifs)
                         self._open_ifs = self._open_ifs[: self._switch_ifs_start]
-                self._w(o, "default:\nbreak;\n}")
-                if self._block_depth > 0:
-                    self._block_depth -= 1
-                # Restore previous switch state
-                if self._switch_stack:
-                    prev = self._switch_stack.pop()
-                    self._in_switch = prev[0]
-                    self._switch_labels = prev[1]
-                    self._switch_default_target = prev[2]
-                    self._switch_ifs_start = prev[3]
-                else:
-                    self._in_switch = False
+                    self._w(o, "default:\nbreak;\n}")
+                    self._just_closed_switch = True
+                    if self._block_depth > 0:
+                        self._block_depth -= 1
+                    if self._switch_stack:
+                        prev = self._switch_stack.pop()
+                        self._in_switch = prev[0]
+                        self._switch_labels = prev[1]
+                        self._switch_default_target = prev[2]
+                        self._switch_ifs_start = prev[3]
+                    else:
+                        self._in_switch = False
             else:
                 # Close if-blocks from previous case before writing new case label
                 new_ifs = len(self._open_ifs) - self._switch_ifs_start
@@ -382,7 +417,7 @@ class DecompileEngine:
                 else:
                     prefix = ""
                 self._w(o, prefix + "\n".join(labels))
-            del self._switch_labels[o]
+            self._switch_labels.pop(o, None)
 
         # Close any if-blocks whose target matches this offset
         while self._open_ifs and self._open_ifs[-1][1] == o:
@@ -412,11 +447,14 @@ class DecompileEngine:
                 self._w(o, "}" * close_count)
         elif nm in ("pop", "popv", "setrval"):
             rv = self._pop()
+            if self._skip_next_pop:
+                self._skip_next_pop = False
+                return
             s = rv.get_value()
             # Skip pops that are part of iterator loop control flow
             if o in self._iter_pops:
                 pass
-            elif s and s != "undefined":
+            elif s and s != "undefined" and not s.startswith("(+"):
                 self._w(o, s + ";")
         elif nm == "popn":
             for _ in range(p.get("n", 0)):
@@ -434,6 +472,12 @@ class DecompileEngine:
             self._push(**v1.copy())
             self._push(**v2.copy())
             self._push(**v1.copy())
+        elif nm == "dupat":
+            idx = p.get("n", 0)
+            if idx < len(self._stack):
+                self._push(**self._stack[-(idx + 1)].copy())
+            else:
+                self._push(tp="script", script=f"_dupat_{idx}")
         elif nm == "swap":
             v1 = self._pop()
             v2 = self._pop()
@@ -453,9 +497,6 @@ class DecompileEngine:
             tgt = o + p.get("offset", 0)
             cond = v.get_value()
             if p.get("offset", 0) > 0:
-                # ifeq jumps when true = skip body when cond is true
-                # So we need to negate: if (!(cond)) { body }
-                # For comparisons, negate the operator directly
                 cond = self._negate_condition(cond)
                 self._w(o, f"if ({cond}) {{")
                 self._open_ifs.append((o, tgt))
@@ -467,7 +508,6 @@ class DecompileEngine:
         elif nm == "ifne":
             v = self._pop()
             tgt = o + p.get("offset", 0)
-            # Skip ifnes that are part of iterator loop control flow
             if o in self._iter_ifnes:
                 pass
             elif p.get("offset", 0) > 0:
@@ -511,6 +551,9 @@ class DecompileEngine:
                         self._w(tgt, "}")
                     else:
                         self._w(o, "break;")
+                elif self._just_closed_switch:
+                    self._just_closed_switch = False
+                    pass
                 elif self._try_depth > 0:
                     pass
                 elif tgt >= (self.d.ops[-1]["off"] if self.d.ops else 0) - 8:
@@ -545,6 +588,16 @@ class DecompileEngine:
             fn = callee.name if callee.name is not None else callee.get_value()
             args = ",".join(a.get_value() for a in reversed(argv))
             pre = "new " if nm == "new" else ""
+            call_str = pre + fn + "(" + args + ")"
+            self._push(tp="script", script=call_str)
+        elif nm in ("spreadcall", "spreadnew", "spreadeval"):
+            argc = p.get("argc", 0)
+            argv = [self._pop() for _ in range(argc)]
+            this_ = self._pop()
+            callee = self._pop()
+            fn = callee.name if callee.name is not None else callee.get_value()
+            args = ",".join(a.get_value() for a in reversed(argv))
+            pre = "new " if nm == "spreadnew" else ""
             call_str = pre + fn + "(" + args + ")"
             self._push(tp="script", script=call_str)
 
@@ -596,6 +649,13 @@ class DecompileEngine:
             if _is_numeric(ov):
                 ov = "(" + ov + ")"
             self._push(tp="script", script=f"delete {ov}[{idx.get_value()}]")
+        elif nm == "mutateproto":
+            proto = self._pop()
+            obj = self._pop()
+            ov = obj.get_value()
+            if _is_numeric(ov):
+                ov = "(" + ov + ")"
+            self._push(tp="script", script=f"{ov}.__proto__={proto.get_value()}")
         elif nm == "length":
             obj = self._pop()
             ov = obj.get_value()
@@ -655,6 +715,9 @@ class DecompileEngine:
         elif nm == "lambda":
             idx = p.get("idx", 0)
             self._push(tp="function", value=f"__L_{idx}__")
+        elif nm == "lambda_arrow":
+            idx = p.get("idx", 0)
+            self._push(tp="function", value=f"__L_{idx}__")
         elif nm == "getfunns":
             self._push(tp="function", value=p.get("idx", 0))
 
@@ -683,22 +746,27 @@ class DecompileEngine:
             if lv:
                 self._push(name=lv.name)
             else:
-                self._push(name=f"l{ln}")
+                name = (
+                    self.d.var_slot_names[ln]
+                    if ln < len(self.d.var_slot_names) and self.d.var_slot_names[ln]
+                    else f"_var_{ln}"
+                )
+                self._push(name=name)
         elif nm == "setlocal":
             val = self._pop()
             ln = p.get("localno", 0)
-            # Suppress setlocal right after iternext (it's the loop variable assignment)
+            self._assigned_local_slots.add(ln)
             if (
                 self._iter_suppress_setlocal is not None
                 and self._iter_suppress_setlocal == ln
             ):
                 self._iter_suppress_setlocal = None
-                name = "l%d" % ln
+                name = _infer_var_name(val, ln, self.d.var_slot_names)
                 item = StackItem(tp="script", name=name, script=name)
                 self._local_vars[ln] = item
                 self._push(**item.copy())
                 return
-            name = f"l{ln}"
+            name = _infer_var_name(val, ln, self.d.var_slot_names)
             item = StackItem(tp="script", name=name, script=f"{name}={val.get_value()}")
             self._local_vars[ln] = item
             self._push(**item.copy())
@@ -749,8 +817,17 @@ class DecompileEngine:
                     self._push(tp="script", script=f"({name}{op})")
             elif nm in ("inclocal", "declocal", "localinc", "localdec"):
                 ln = p.get("localno", 0)
+                self._assigned_local_slots.add(ln)
                 lv = self._local_vars.get(ln)
-                name = lv.name if lv else f"l{ln}"
+                name = (
+                    lv.name
+                    if lv
+                    else (
+                        self.d.var_slot_names[ln]
+                        if ln < len(self.d.var_slot_names) and self.d.var_slot_names[ln]
+                        else f"_var_{ln}"
+                    )
+                )
                 if is_prefix:
                     self._push(tp="script", script=f"{op}{name}")
                 else:
@@ -762,6 +839,39 @@ class DecompileEngine:
                 "aliasedvardec",
             ):
                 var_name = self._resolve_aliased_var(p.get("hops", 0), p.get("slot", 0))
+                slot = p.get("slot", 0)
+                hops = p.get("hops", 0)
+                is_cocos = getattr(self.d, "is_cocos", False)
+                if is_cocos and not is_prefix:
+                    skip = False
+                    ops = self.d.ops
+                    for si in range(len(ops)):
+                        if ops[si]["off"] == o and ops[si]["nm"] == nm:
+                            if si + 8 < len(ops):
+                                seq = [ops[si + k]["nm"] for k in range(1, 9)]
+                                sslots = [
+                                    ops[si + k].get("params", {}).get("slot", -1)
+                                    for k in range(1, 9)
+                                ]
+                                arith = "add" if is_inc else "sub"
+                                if (
+                                    seq[0] == "pop"
+                                    and seq[1] == "getaliasedvar"
+                                    and sslots[1] == slot
+                                    and seq[2] == "pos"
+                                    and seq[3] == "dup"
+                                    and seq[4] == "one"
+                                    and seq[5] == arith
+                                    and seq[6] == "setaliasedvar"
+                                    and sslots[6] == slot
+                                    and seq[7] == "pop"
+                                ):
+                                    skip = True
+                            break
+                    if skip:
+                        self._push(tp="void", value=None)
+                        self._skip_next_pop = True
+                        return
                 if is_prefix:
                     self._push(tp="script", script=f"{op}{var_name}")
                 else:
@@ -909,6 +1019,37 @@ class DecompileEngine:
             self._push(
                 tp="script", script=f"({l.get_value()} {sym_map[nm]} {r.get_value()})"
             )
+        elif nm in (
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "mod",
+            "bitand",
+            "bitor",
+            "bitxor",
+            "lsh",
+            "rsh",
+            "ursh",
+        ):
+            r = self._pop()
+            l = self._pop()
+            sym_map = {
+                "add": "+",
+                "sub": "-",
+                "mul": "*",
+                "div": "/",
+                "mod": "%",
+                "bitand": "&",
+                "bitor": "|",
+                "bitxor": "^",
+                "lsh": "<<",
+                "rsh": ">>",
+                "ursh": ">>>",
+            }
+            self._push(
+                tp="script", script=f"({l.get_value()} {sym_map[nm]} {r.get_value()})"
+            )
         elif nm == "not":
             v = self._pop()
             self._push(tp="script", script=f"(!{v.get_value()})")
@@ -918,6 +1059,12 @@ class DecompileEngine:
         elif nm == "neg":
             v = self._pop()
             self._push(tp="script", script=f"(-{v.get_value()})")
+        elif nm == "pos":
+            v = self._pop()
+            self._push(tp="script", script=f"(+{v.get_value()})")
+        elif nm == "tostring":
+            v = self._pop()
+            self._push(tp="script", script=f"String({v.get_value()})")
         elif nm in ("typeof", "typeofexpr"):
             self._push(tp="script", script="typeof " + self._pop().get_value())
 
@@ -926,6 +1073,8 @@ class DecompileEngine:
             kind = p.get("kind", 0)
             self._push(tp="object", value={} if kind == 0 else {})
         elif nm == "newarray":
+            self._push(tp="array", value=[])
+        elif nm == "newarray_copyonwrite":
             self._push(tp="array", value=[])
         elif nm in ("newobject", "object"):
             self._push(tp="object", value={})
@@ -942,7 +1091,30 @@ class DecompileEngine:
             self._push(
                 tp="object", value=obj.value if isinstance(obj.value, dict) else {}
             )
+        elif nm in ("initprop_getter", "initprop_setter"):
+            val = self._pop()
+            obj = self._pop()
+            aname = self._atom(p.get("idx", 0))
+            if self._is_ident(aname):
+                key_str = aname
+            else:
+                key_str = _js_str(aname)
+            accessor = "get" if "getter" in nm else "set"
+            if isinstance(obj.value, dict):
+                obj.value[key_str] = val
+            self._push(
+                tp="object", value=obj.value if isinstance(obj.value, dict) else {}
+            )
         elif nm in ("initelem", "initelem_inc"):
+            val = self._pop()
+            name = self._pop()
+            obj = self._pop()
+            if isinstance(obj.value, dict):
+                obj.value[name.get_value()] = val
+            self._push(
+                tp="object", value=obj.value if isinstance(obj.value, dict) else {}
+            )
+        elif nm in ("initelem_getter", "initelem_setter"):
             val = self._pop()
             name = self._pop()
             obj = self._pop()
@@ -1044,8 +1216,21 @@ class DecompileEngine:
                 self._try_depth -= 1
             if self._try_if_base:
                 self._try_if_base.pop()
-            self._in_switch = False
-            self._switch_labels = {}
+            if self._in_switch and self._switch_stack:
+                prev = self._switch_stack.pop()
+                self._in_switch = prev[0]
+                self._switch_labels = prev[1]
+                self._switch_default_target = prev[2]
+                self._switch_ifs_start = prev[3]
+            else:
+                self._in_switch = False
+                self._switch_labels = {}
+        elif nm == "debugleaveblock":
+            pass
+        elif nm == "pushblockscope":
+            pass
+        elif nm == "popblockscope":
+            pass
 
         # switch
         elif nm == "condswitch":
@@ -1056,6 +1241,7 @@ class DecompileEngine:
                     dict(self._switch_labels),
                     self._switch_default_target,
                     self._switch_ifs_start,
+                    self._block_depth,
                 )
             )
             v = self._stack[-1] if self._stack else StackItem()
@@ -1073,7 +1259,7 @@ class DecompileEngine:
             self._switch_labels[tgt].append(label_text)
         elif nm == "default":
             if self._stack:
-                self._pop()  # pop the switch value
+                self._pop()
             tgt = o + p.get("offset", 0)
             self._switch_default_target = tgt
             if tgt not in self._switch_labels:
@@ -1128,7 +1314,16 @@ class DecompileEngine:
                         if next_op["nm"] == "setlocal":
                             ln = next_op["params"].get("localno", 0)
                             lv = self._local_vars.get(ln)
-                            loop_var = lv.name if lv else "l%d" % ln
+                            loop_var = (
+                                lv.name
+                                if lv
+                                else (
+                                    self.d.var_slot_names[ln]
+                                    if ln < len(self.d.var_slot_names)
+                                    and self.d.var_slot_names[ln]
+                                    else f"_var_{ln}"
+                                )
+                            )
                             # Suppress the redundant setlocal after iternext
                             self._iter_suppress_setlocal = ln
                         elif next_op["nm"] == "setaliasedvar":
@@ -1161,7 +1356,16 @@ class DecompileEngine:
                                 if op3["nm"] == "getelem" and op4["nm"] == "setlocal":
                                     ln = op4["params"].get("localno", 0)
                                     lv = self._local_vars.get(ln)
-                                    loop_var = lv.name if lv else "l%d" % ln
+                                    loop_var = (
+                                        lv.name
+                                        if lv
+                                        else (
+                                            self.d.var_slot_names[ln]
+                                            if ln < len(self.d.var_slot_names)
+                                            and self.d.var_slot_names[ln]
+                                            else f"_var_{ln}"
+                                        )
+                                    )
                                     # Suppress the setlocal for key extraction
                                     self._iter_suppress_setlocal = ln
                                     # Also mark the subsequent dup+getelem+setlocal
@@ -1193,6 +1397,12 @@ class DecompileEngine:
                     break
         elif nm == "yield":
             self._push(tp="script", script="yield " + self._pop().get_value())
+        elif nm == "callsiteobj":
+            self._push(tp="script", script="_callsite")
+        elif nm == "runonce":
+            pass
+        elif nm in ("enterlet0", "enterlet1"):
+            pass
 
     # ────────────────────────────────────────────────────
     def emit(self):
@@ -1237,4 +1447,35 @@ class DecompileEngine:
 
         result = _re.sub(r"\b_av(\d+)\b", _av_replace, result)
 
+        var_names = self._collect_var_decl_names(result)
+        if var_names:
+            var_line = "var " + ", ".join(var_names) + ";"
+            if result.startswith("// source:"):
+                nl = result.index("\n")
+                result = result[: nl + 1] + var_line + "\n" + result[nl + 1 :]
+            else:
+                result = var_line + "\n" + result
+
         return result
+
+    def _collect_var_decl_names(self, result):
+        import re as _re
+
+        names = set()
+        for slot, item in self._local_vars.items():
+            nm = item.name if hasattr(item, "name") else str(item)
+            if nm and _re.match(r"^(_var_\d+|[lv]\d+)$", nm):
+                if slot in self._assigned_local_slots:
+                    names.add(nm)
+        for m in _re.finditer(r"\b(_var_\d+)\b", result):
+            nm = m.group(1)
+            slot_match = _re.match(r"^_var_(\d+)$", nm)
+            if slot_match:
+                slot = int(slot_match.group(1))
+                if slot in self._assigned_local_slots:
+                    names.add(nm)
+            else:
+                names.add(nm)
+        if not names:
+            return []
+        return sorted(names, key=lambda s: (len(s), s))

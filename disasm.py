@@ -23,6 +23,8 @@ class DisasmFunc:
         "sbits",
         "argvs",
         "var_slot_names",
+        "aliased_flags",
+        "aliased_slot_offset",
         "atoms",
         "consts",
         "ops",
@@ -30,6 +32,7 @@ class DisasmFunc:
         "source_path",
         "source_text",
         "is_cocos",
+        "parent",
     )
 
     def __init__(self):
@@ -47,6 +50,8 @@ class DisasmFunc:
         self.sbits = 0
         self.argvs = []
         self.var_slot_names = []
+        self.aliased_flags = []
+        self.aliased_slot_offset = 0
         self.atoms = []
         self.consts = []
         self.ops = []
@@ -54,6 +59,7 @@ class DisasmFunc:
         self.source_path = ""
         self.source_text = ""
         self.is_cocos = False
+        self.parent = None
 
     def to_text(self):
         lines = []
@@ -73,6 +79,12 @@ class DisasmFunc:
             for v in self.var_slot_names:
                 parts.append(f'"{_esc(v)}"' if v else '""')
             lines.append(".varslots " + " ".join(parts))
+        if self.aliased_flags and any(self.aliased_flags):
+            lines.append(
+                ".aliased " + " ".join("1" if a else "0" for a in self.aliased_flags)
+            )
+        if self.aliased_slot_offset:
+            lines.append(f".aliased_offset {self.aliased_slot_offset}")
         for i, a in enumerate(self.atoms):
             lines.append(f'.atom {i} "{_esc(a)}"')
         for i, c in enumerate(self.consts):
@@ -100,6 +112,10 @@ class DisasmFunc:
             lines.append(" ".join(parts))
         for child in self.children:
             lines.append("")
+            if child is None:
+                # Placeholder for non-JSFunction objects (Block, With, JSObj)
+                lines.append(".nullchild")
+                continue
             lines.append(".begin")
             lines.extend(child.to_text().splitlines())
             lines.append(".end")
@@ -113,6 +129,9 @@ class DisasmFunc:
         depth = 0
         for line in text.splitlines():
             stripped = line.strip()
+            if stripped == ".nullchild" and depth == 0:
+                children.append(None)
+                continue
             if stripped == ".begin":
                 depth += 1
                 if depth == 1:
@@ -162,6 +181,10 @@ class DisasmFunc:
                 func.argvs = _parse_string_list(stripped[7:])
             elif stripped.startswith(".varslots "):
                 func.var_slot_names = _parse_string_list(stripped[10:])
+            elif stripped.startswith(".aliased "):
+                func.aliased_flags = [p == "1" for p in stripped[9:].split()]
+            elif stripped.startswith(".aliased_offset "):
+                func.aliased_slot_offset = int(stripped[16:])
             elif stripped.startswith(".atom "):
                 parts = stripped.split(None, 2)
                 idx = int(parts[1])
@@ -208,6 +231,9 @@ class DisasmFunc:
                             params[pk] = pv
                 func.ops.append({"off": off, "nm": nm, "params": params, "len": 0})
         func.children = children
+        for child in children:
+            if child is not None:
+                child.parent = func
         return func
 
 
