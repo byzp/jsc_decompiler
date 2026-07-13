@@ -55,7 +55,6 @@ class DecompileEngine:
         self._assigned_local_slots = set()
         self._stack = []
         self.script = {}
-        self.logic_stacks = {}
         self.branch_map = {}
         self.loop_entries = set()
         self._sub_level = 0
@@ -70,6 +69,12 @@ class DecompileEngine:
         self._just_closed_switch = False  # True right after default: closes a switch
         self._skip_next_pop = (
             False  # True to suppress synthetic pop after skipped inc/dec
+        )
+        self._skip_ops_count = (
+            0  # number of ops to skip (Cocos expanded inc/dec sequences)
+        )
+        self._pending_logic = (
+            None  # pending and/or condition to combine with next ifeq/ifne
         )
         self._switch_labels = {}  # target_offset → 'case val:' / 'default:'
         self._switch_stack = (
@@ -100,8 +105,24 @@ class DecompileEngine:
         self._iter_moreiters = set()  # offsets of moreiters in iter loops
         self._iter_pops = set()  # offsets of pops between moreiter and enditer
         self._iter_loopentries = set()  # offsets of loopentry in iter loops
+        self._iter_enditers = set()  # offsets of enditer ops (loop end) in iter loops
         self._deffun_names = set()  # names declared by deffun
+        self._while_loops = (
+            {}
+        )  # goto_offset → {loophead_offset, loopentry_offset, ifne_offset, ifne_target, condition_ops}
+        self._while_loop_gotos = set()  # offsets of gotos that start while loops
+        self._while_loop_ifnes = set()  # offsets of ifnes that close while loops
+        self._while_loop_exits = set()  # offsets of gotos after ifne (loop exit)
+        self._while_loop_heads = set()  # offsets of loophead ops in while loops
+        self._while_loop_entries = set()  # offsets of loopentry ops in while loops
+        self._while_loop_cond_range = (
+            set()
+        )  # (off) offsets of ops in while loop condition (between loopentry and ifne)
+        self._while_open = (
+            []
+        )  # stack of open while loops: [(loophead_off, ifne_off, exit_goto_off)]
         self._build_iter_loop_map()
+        self._build_while_loop_map()
         self._prescan_deffun_names()
 
     def _build_iter_loop_map(self):
@@ -150,6 +171,8 @@ class DecompileEngine:
                     self._iter_ifnes.add(ifne_off)
                 if moreiter_off is not None:
                     self._iter_moreiters.add(moreiter_off)
+                if loop_end_off is not None:
+                    self._iter_enditers.add(loop_end_off)
                 if moreiter_off is not None and loop_end_off is not None:
                     for k in range(n):
                         if (
@@ -160,6 +183,71 @@ class DecompileEngine:
                                 self._iter_pops.add(ops[k]["off"])
                             elif ops[k]["nm"] == "loopentry":
                                 self._iter_loopentries.add(ops[k]["off"])
+
+    def _build_while_loop_map(self):
+        """Pre-scan ops to identify while loops (goto->loopentry pattern)."""
+        ops = self.d.ops
+        n = len(ops)
+        # Build iter_gotos set first (needed to exclude iterator loops)
+        iter_gotos = set()
+        for i in range(n):
+            if ops[i]["nm"] != "iter":
+                continue
+            for j in range(i + 1, n):
+                if ops[j]["nm"] == "goto" and ops[j]["params"].get("offset", 0) > 0:
+                    iter_gotos.add(ops[j]["off"])
+                    break
+                if ops[j]["nm"] == "iternext":
+                    break
+                if ops[j]["nm"] == "iter":
+                    break
+        for i in range(n):
+            if ops[i]["nm"] != "goto":
+                continue
+            offset = ops[i]["params"].get("offset", 0)
+            if offset <= 0:
+                continue
+            # Skip gotos that are part of iterator loops
+            if ops[i]["off"] in iter_gotos:
+                continue
+            tgt = ops[i]["off"] + offset
+            goto_off = ops[i]["off"]
+            loophead_off = None
+            loopentry_idx = None
+            for j in range(i + 1, n):
+                if ops[j]["nm"] == "loophead" and loophead_off is None:
+                    loophead_off = ops[j]["off"]
+                if ops[j]["off"] == tgt and ops[j]["nm"] == "loopentry":
+                    loopentry_idx = j
+                    break
+                if ops[j]["off"] > tgt:
+                    break
+            if loopentry_idx is None or loophead_off is None:
+                continue
+            for k in range(loopentry_idx + 1, min(loopentry_idx + 20, n)):
+                if ops[k]["nm"] == "ifne" and ops[k]["params"].get("offset", 0) < 0:
+                    ifne_tgt = ops[k]["off"] + ops[k]["params"]["offset"]
+                    if ifne_tgt == loophead_off:
+                        self._while_loops[goto_off] = {
+                            "loophead_off": loophead_off,
+                            "loopentry_off": tgt,
+                            "ifne_off": ops[k]["off"],
+                            "ifne_idx": k,
+                            "loopentry_idx": loopentry_idx,
+                        }
+                        self._while_loop_gotos.add(goto_off)
+                        self._while_loop_ifnes.add(ops[k]["off"])
+                        self._while_loop_heads.add(loophead_off)
+                        self._while_loop_entries.add(tgt)
+                        for ci in range(loopentry_idx, k + 1):
+                            self._while_loop_cond_range.add(ops[ci]["off"])
+                        if (
+                            k + 1 < n
+                            and ops[k + 1]["nm"] == "goto"
+                            and ops[k + 1]["params"].get("offset", 0) > 0
+                        ):
+                            self._while_loop_exits.add(ops[k + 1]["off"])
+                    break
 
     def _prescan_deffun_names(self):
         """Pre-scan ops to find all deffun names, so defvar can skip them."""
@@ -172,6 +260,9 @@ class DecompileEngine:
 
     def run(self):
         for op in self.d.ops:
+            if self._skip_ops_count > 0:
+                self._skip_ops_count -= 1
+                continue
             try:
                 self._dispatch(op)
             except Exception as e:
@@ -441,7 +532,16 @@ class DecompileEngine:
             else:
                 self._w(o, "return;")
             # Close any open if-blocks at function exit
-            if self._open_ifs:
+            # When inside a while loop, only close if-blocks opened inside the loop
+            if self._while_open:
+                wh = self._while_open[-1][0]
+                close_count = 0
+                while self._open_ifs and self._open_ifs[-1][0] > wh:
+                    self._open_ifs.pop()
+                    close_count += 1
+                if close_count > 0:
+                    self._w(o, "}" * close_count)
+            elif self._open_ifs:
                 close_count = len(self._open_ifs)
                 self._open_ifs.clear()
                 self._w(o, "}" * close_count)
@@ -450,11 +550,13 @@ class DecompileEngine:
             if self._skip_next_pop:
                 self._skip_next_pop = False
                 return
+            if rv.type == "logic":
+                return
             s = rv.get_value()
             # Skip pops that are part of iterator loop control flow
             if o in self._iter_pops:
                 pass
-            elif s and s != "undefined" and not s.startswith("(+"):
+            elif s and s != "undefined" and s != "void" and not s.startswith("(+"):
                 self._w(o, s + ";")
         elif nm == "popn":
             for _ in range(p.get("n", 0)):
@@ -496,8 +598,11 @@ class DecompileEngine:
             v = self._pop()
             tgt = o + p.get("offset", 0)
             cond = v.get_value()
+            if self._pending_logic is not None:
+                op, lhs = self._pending_logic
+                self._pending_logic = None
+                cond = f"({lhs} {op} {cond})"
             if p.get("offset", 0) > 0:
-                cond = self._negate_condition(cond)
                 self._w(o, f"if ({cond}) {{")
                 self._open_ifs.append((o, tgt))
                 self.branch_map[o] = {"goto": tgt, "type": "if"}
@@ -508,10 +613,22 @@ class DecompileEngine:
         elif nm == "ifne":
             v = self._pop()
             tgt = o + p.get("offset", 0)
+            cond = v.get_value()
+            if self._pending_logic is not None:
+                op, lhs = self._pending_logic
+                self._pending_logic = None
+                cond = f"({lhs} {op} {cond})"
             if o in self._iter_ifnes:
                 pass
+            elif o in self._while_loop_ifnes:
+                self._w(o, f"if (!({cond})) break;")
+                if self._while_open:
+                    self._while_open.pop()
+                self._w(o, "}")
+                if self._block_depth > 0:
+                    self._block_depth -= 1
             elif p.get("offset", 0) > 0:
-                self._w(o, "if (" + v.get_value() + ") {")
+                self._w(o, f"if ({cond}) {{")
                 self._open_ifs.append((o, tgt))
                 self.branch_map[o] = {"goto": tgt, "type": "if"}
             else:
@@ -519,15 +636,19 @@ class DecompileEngine:
                 self.branch_map[tgt] = {
                     "goto": o,
                     "type": "loop_head",
-                    "cond": v.get_value(),
+                    "cond": cond,
                 }
 
         elif nm == "loophead":
-            pass
+            if o in self._while_loop_heads:
+                pass
 
         elif nm == "loopentry":
             # Skip loopentry in iterator loops (already handled by for-in/for-of structure)
             if o in self._iter_loopentries:
+                pass
+            # Skip loopentry in while loops (condition is handled at ifne)
+            elif o in self._while_loop_entries:
                 pass
 
         elif nm == "goto":
@@ -535,12 +656,41 @@ class DecompileEngine:
             # Skip gotos that are part of iterator loop control flow
             if o in self._iter_gotos:
                 pass
+            # While loop: goto -> loopentry
+            elif o in self._while_loop_gotos:
+                wl = self._while_loops[o]
+                loophead_off = wl["loophead_off"]
+                ifne_off = wl["ifne_off"]
+                loopentry_off = wl["loopentry_off"]
+                exit_goto_off = None
+                ops = self.d.ops
+                ifne_idx = wl["ifne_idx"]
+                if (
+                    ifne_idx + 1 < len(ops)
+                    and ops[ifne_idx + 1]["nm"] == "goto"
+                    and ops[ifne_idx + 1]["params"].get("offset", 0) > 0
+                ):
+                    exit_goto_off = ops[ifne_idx + 1]["off"]
+                self._while_open.append((loophead_off, ifne_off, exit_goto_off))
+                self._w(o, "while (true) {")
+                self._block_depth += 1
             elif p.get("offset", 0) < 0:
                 if tgt in self.loop_entries:
                     self._w(o, "continue;")
                 else:
                     pass
             elif p.get("offset", 0) > 0:
+                # Check if this goto is inside a while loop and jumps out
+                in_while = False
+                wl_head = 0
+                for wh, wi, we in reversed(self._while_open):
+                    if o > wh and o < wi:
+                        if tgt > wi or (we is not None and tgt == we):
+                            in_while = True
+                            wl_head = wh
+                            break
+                # Check if this goto jumps to an enditer (break out of for-in loop)
+                is_iter_break = tgt in self._iter_enditers
                 if self._in_switch:
                     if tgt == self._switch_default_target:
                         self._w(o, "break;")
@@ -551,11 +701,76 @@ class DecompileEngine:
                         self._w(tgt, "}")
                     else:
                         self._w(o, "break;")
+                elif in_while:
+                    self._w(o, "break;")
+                elif is_iter_break:
+                    close_count = 0
+                    while self._open_ifs:
+                        if_off, if_tgt = self._open_ifs[-1]
+                        inside_iter = False
+                        for iternext_off, info in self._iter_loops.items():
+                            iter_off = info["iter_off"]
+                            end_off = info["loop_end_off"]
+                            if iter_off < if_off < end_off:
+                                inside_iter = True
+                                break
+                        if inside_iter:
+                            close_count += 1
+                            self._open_ifs.pop()
+                        else:
+                            break
+                    if close_count > 0:
+                        self._w(o, "}" * close_count)
+                    self._w(o, "break;")
+                    # Skip the dead goto that often follows a break in for-in loops
+                    idx = None
+                    for si in range(len(self.d.ops)):
+                        if (
+                            self.d.ops[si]["off"] == o
+                            and self.d.ops[si]["nm"] == "goto"
+                        ):
+                            idx = si
+                            break
+                    if idx is not None and idx + 1 < len(self.d.ops):
+                        next_op = self.d.ops[idx + 1]
+                        if (
+                            next_op["nm"] == "goto"
+                            and next_op.get("params", {}).get("offset", 0) > 0
+                        ):
+                            self._skip_ops_count = 1
                 elif self._just_closed_switch:
                     self._just_closed_switch = False
                     pass
                 elif self._try_depth > 0:
                     pass
+                elif self._open_ifs:
+                    if_off, if_tgt = self._open_ifs[-1]
+                    if tgt == if_tgt:
+                        pass
+                    elif self._while_open and tgt < self._while_open[-1][1]:
+                        pass
+                    else:
+                        self._open_ifs.pop()
+                        self._w(o, "} else {")
+                        self._open_ifs.append((if_tgt, tgt))
+                    # Check if next op is a dead goto (from and/or short-circuit)
+                    # These are unreachable gotos that appear right after the
+                    # if/else goto and should be skipped
+                    idx = None
+                    for si in range(len(self.d.ops)):
+                        if (
+                            self.d.ops[si]["off"] == o
+                            and self.d.ops[si]["nm"] == "goto"
+                        ):
+                            idx = si
+                            break
+                    if idx is not None and idx + 1 < len(self.d.ops):
+                        next_op = self.d.ops[idx + 1]
+                        if (
+                            next_op["nm"] == "goto"
+                            and next_op.get("params", {}).get("offset", 0) > 0
+                        ):
+                            self._skip_ops_count = 1
                 elif tgt >= (self.d.ops[-1]["off"] if self.d.ops else 0) - 8:
                     close_count = len(self._open_ifs)
                     self._open_ifs.clear()
@@ -563,20 +778,12 @@ class DecompileEngine:
                     self._w(tgt, "}" * close_count)
         elif nm == "or":
             v = self._pop()
-            self.logic_stacks[o] = {
-                "type": "or",
-                "goto": o + p.get("offset", 0),
-                "value": v.get_value(),
-            }
-            self._push(tp="logic")
+            self._pending_logic = ("||", v.get_value())
+            self._skip_next_pop = True
         elif nm == "and":
             v = self._pop()
-            self.logic_stacks[o] = {
-                "type": "and",
-                "goto": o + p.get("offset", 0),
-                "value": v.get_value(),
-            }
-            self._push(tp="logic")
+            self._pending_logic = ("&&", v.get_value())
+            self._skip_next_pop = True
 
         # function calls
         elif nm in ("call", "new", "funcall", "eval", "funapply"):
@@ -620,7 +827,19 @@ class DecompileEngine:
                 fv = str(val.value) if val.value is not None else ""
                 if not fv.startswith("__L_"):
                     val_str = "function(){ " + val_str + " }"
-            self._push(tp="script", script=f"{ov}{aname_expr}={val_str}")
+            next_is_cond = False
+            for si in range(len(self.d.ops)):
+                if self.d.ops[si]["off"] == o and self.d.ops[si]["nm"] == "setprop":
+                    if si + 1 < len(self.d.ops) and self.d.ops[si + 1]["nm"] in (
+                        "ifeq",
+                        "ifne",
+                    ):
+                        next_is_cond = True
+                    break
+            if next_is_cond:
+                self._push(tp="script", script=f"({ov}{aname_expr}=== {val_str})")
+            else:
+                self._push(tp="script", script=f"{ov}{aname_expr}={val_str}")
         elif nm == "delprop":
             obj = self._pop()
             ov = obj.get_value()
@@ -817,6 +1036,50 @@ class DecompileEngine:
                     self._push(tp="script", script=f"({name}{op})")
             elif nm in ("inclocal", "declocal", "localinc", "localdec"):
                 ln = p.get("localno", 0)
+                is_cocos = getattr(self.d, "is_cocos", False)
+                if is_cocos and not is_prefix:
+                    skip = False
+                    ops = self.d.ops
+                    for si in range(len(ops)):
+                        if ops[si]["off"] == o and ops[si]["nm"] == nm:
+                            if si + 9 < len(ops):
+                                seq = [ops[si + k]["nm"] for k in range(1, 10)]
+                                slocals = [
+                                    ops[si + k].get("params", {}).get("localno", -1)
+                                    for k in range(1, 10)
+                                ]
+                                arith = "add" if is_inc else "sub"
+                                if (
+                                    seq[0] == "pop"
+                                    and seq[1] == "getlocal"
+                                    and seq[2] == "pos"
+                                    and seq[3] == "dup"
+                                    and seq[4] == "one"
+                                    and seq[5] == arith
+                                    and seq[6] == "setlocal"
+                                    and slocals[6] == slocals[1]
+                                    and seq[7] == "pop"
+                                    and seq[8] == "pop"
+                                ):
+                                    skip = True
+                                    ln = slocals[1]
+                            break
+                    if skip:
+                        self._assigned_local_slots.add(ln)
+                        lv = self._local_vars.get(ln)
+                        name = (
+                            lv.name
+                            if lv
+                            else (
+                                self.d.var_slot_names[ln]
+                                if ln < len(self.d.var_slot_names)
+                                and self.d.var_slot_names[ln]
+                                else f"_var_{ln}"
+                            )
+                        )
+                        self._push(tp="script", script=f"({name}{op})")
+                        self._skip_ops_count = 8
+                        return
                 self._assigned_local_slots.add(ln)
                 lv = self._local_vars.get(ln)
                 name = (
@@ -847,11 +1110,11 @@ class DecompileEngine:
                     ops = self.d.ops
                     for si in range(len(ops)):
                         if ops[si]["off"] == o and ops[si]["nm"] == nm:
-                            if si + 8 < len(ops):
-                                seq = [ops[si + k]["nm"] for k in range(1, 9)]
+                            if si + 9 < len(ops):
+                                seq = [ops[si + k]["nm"] for k in range(1, 10)]
                                 sslots = [
                                     ops[si + k].get("params", {}).get("slot", -1)
-                                    for k in range(1, 9)
+                                    for k in range(1, 10)
                                 ]
                                 arith = "add" if is_inc else "sub"
                                 if (
@@ -865,12 +1128,13 @@ class DecompileEngine:
                                     and seq[6] == "setaliasedvar"
                                     and sslots[6] == slot
                                     and seq[7] == "pop"
+                                    and seq[8] == "pop"
                                 ):
                                     skip = True
                             break
                     if skip:
-                        self._push(tp="void", value=None)
-                        self._skip_next_pop = True
+                        self._push(tp="script", script=f"({var_name}{op})")
+                        self._skip_ops_count = 8
                         return
                 if is_prefix:
                     self._push(tp="script", script=f"{op}{var_name}")
@@ -892,15 +1156,82 @@ class DecompileEngine:
                 else:
                     self._push(tp="script", script=f"({name}{op})")
             elif nm in ("incprop", "decprop", "propinc", "propdec"):
-                obj = self._pop()
                 aname_expr = self._prop(p.get("idx", 0))
-                ov = obj.get_value()
-                if _is_numeric(ov):
-                    ov = "(" + ov + ")"
-                if is_prefix:
-                    self._push(tp="script", script=f"{op}{ov}{aname_expr}")
-                else:
+                is_cocos = getattr(self.d, "is_cocos", False)
+                if is_cocos and not is_prefix:
+                    obj = self._pop()
+                    ov = obj.get_value()
+                    if _is_numeric(ov):
+                        ov = "(" + ov + ")"
+                    self._push(**obj.copy())
                     self._push(tp="script", script=f"({ov}{aname_expr}{op})")
+                    skip = False
+                    skip_return = False
+                    ops = self.d.ops
+                    idx_val = p.get("idx", 0)
+                    for si in range(len(ops)):
+                        if ops[si]["off"] == o and ops[si]["nm"] == nm:
+                            if si + 12 < len(ops):
+                                seq = [ops[si + k]["nm"] for k in range(1, 13)]
+                                sidxs = [
+                                    ops[si + k].get("params", {}).get("idx", -1)
+                                    for k in range(1, 13)
+                                ]
+                                arith = "add" if is_inc else "sub"
+                                if (
+                                    seq[0] == "pop"
+                                    and seq[1] == "dup"
+                                    and seq[2] == "getprop"
+                                    and sidxs[2] == idx_val
+                                    and seq[3] == "pos"
+                                    and seq[4] == "dup"
+                                    and seq[5] == "one"
+                                    and seq[6] == arith
+                                    and seq[7] == "pick"
+                                    and seq[8] == "swap"
+                                    and seq[9] == "setprop"
+                                    and sidxs[9] == idx_val
+                                    and seq[10] == "pop"
+                                    and seq[11] == "pop"
+                                ):
+                                    skip = True
+                                elif (
+                                    seq[0] == "pop"
+                                    and seq[1] == "dup"
+                                    and seq[2] == "getprop"
+                                    and sidxs[2] == idx_val
+                                    and seq[3] == "pos"
+                                    and seq[4] == "dup"
+                                    and seq[5] == "one"
+                                    and seq[6] == arith
+                                    and seq[7] == "pick"
+                                    and seq[8] == "swap"
+                                    and seq[9] == "setprop"
+                                    and sidxs[9] == idx_val
+                                    and seq[10] == "pop"
+                                    and seq[11] == "return"
+                                ):
+                                    skip = True
+                                    skip_return = True
+                            break
+                    if skip:
+                        self._pop()
+                        self._pop()
+                        if skip_return:
+                            self._w(o, f"return ({ov}{aname_expr}{op});")
+                            self._skip_ops_count = 11
+                        else:
+                            self._skip_ops_count = 11
+                        return
+                else:
+                    obj = self._pop()
+                    ov = obj.get_value()
+                    if _is_numeric(ov):
+                        ov = "(" + ov + ")"
+                    if is_prefix:
+                        self._push(tp="script", script=f"{op}{ov}{aname_expr}")
+                    else:
+                        self._push(tp="script", script=f"({ov}{aname_expr}{op})")
             elif nm in ("incelem", "decelem", "eleminc", "elemdec"):
                 idx = self._pop()
                 obj = self._pop()
@@ -925,13 +1256,10 @@ class DecompileEngine:
         # (it uses SETALIASEDVAR directly), so treating CALLALIASEDVAR as
         # SETALIASEDVAR is safe for both formats.
         elif nm == "callaliasedvar":
-            val = self._pop()
             var_name = self._resolve_aliased_var(p.get("hops", 0), p.get("slot", 0))
             if not var_name:
                 var_name = f'_av{p.get("slot", 0)}'
-            self._push(
-                tp="script", name=var_name, script=f"{var_name}={val.get_value()}"
-            )
+            self._push(name=var_name)
         elif nm == "getaliasedvar":
             var_name = self._resolve_aliased_var(p.get("hops", 0), p.get("slot", 0))
             if not var_name:
@@ -988,8 +1316,19 @@ class DecompileEngine:
         elif nm in IMAGE_OPS:
             r = self._pop()
             l = self._pop()
-            sym = IMAGE_OPS.get(nm, "?")
-            self._push(tp="script", script=f"({l.get_value()} {sym} {r.get_value()})")
+            lv = l.get_value()
+            rv = r.get_value()
+            if nm in ("stricteq", "eq") and rv == "NaN":
+                self._push(tp="script", script=f"isNaN({lv})")
+            elif nm in ("strictne", "ne") and rv == "NaN":
+                self._push(tp="script", script=f"(!isNaN({lv}))")
+            elif nm in ("stricteq", "eq") and lv == "NaN":
+                self._push(tp="script", script=f"isNaN({rv})")
+            elif nm in ("strictne", "ne") and lv == "NaN":
+                self._push(tp="script", script=f"(!isNaN({rv}))")
+            else:
+                sym = IMAGE_OPS.get(nm, "?")
+                self._push(tp="script", script=f"({lv} {sym} {rv})")
         elif nm in (
             "eq",
             "ne",
@@ -1016,9 +1355,18 @@ class DecompileEngine:
                 "in": "in",
                 "instanceof": "instanceof",
             }
-            self._push(
-                tp="script", script=f"({l.get_value()} {sym_map[nm]} {r.get_value()})"
-            )
+            lv = l.get_value()
+            rv = r.get_value()
+            if nm in ("stricteq", "eq") and rv == "NaN":
+                self._push(tp="script", script=f"isNaN({lv})")
+            elif nm in ("strictne", "ne") and rv == "NaN":
+                self._push(tp="script", script=f"(!isNaN({lv}))")
+            elif nm in ("stricteq", "eq") and lv == "NaN":
+                self._push(tp="script", script=f"isNaN({rv})")
+            elif nm in ("strictne", "ne") and lv == "NaN":
+                self._push(tp="script", script=f"(!isNaN({rv}))")
+            else:
+                self._push(tp="script", script=f"({lv} {sym_map[nm]} {rv})")
         elif nm in (
             "add",
             "sub",
@@ -1163,15 +1511,6 @@ class DecompileEngine:
             self._push(name="e")
             self._in_catch = True
         elif nm == "finally":
-            if self._try_if_base:
-                base = self._try_if_base[-1]
-                close_ifs = len(self._open_ifs) - base
-            else:
-                base = 0
-                close_ifs = len(self._open_ifs)
-            if close_ifs > 0:
-                self._w(o, "}" * close_ifs)
-                self._open_ifs = self._open_ifs[:base]
             if self._in_catch:
                 self._w(o, "} finally {")
                 self._in_catch = False

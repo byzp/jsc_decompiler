@@ -91,14 +91,16 @@ def _parse_atoms(data, func, code_end):
     natoms = func.natoms
     atoms = []
     for _ in range(natoms):
-        o = _skip_zero_padding(d, o)
         if o + 4 > len(d):
             break
         raw_len = struct.unpack_from("<I", d, o)[0]
         o += 4
-        if raw_len <= 0 or raw_len > 500:
+        if raw_len < 0 or raw_len > 500:
             atoms.append("")
             o -= 4
+            continue
+        if raw_len == 0:
+            atoms.append("")
             continue
         sz = raw_len * 2
         if o + sz > len(d):
@@ -146,13 +148,14 @@ def _find_atoms_end(data, func, code_end):
     d = data
     o = code_end + func.nsrc
     for _ in range(func.natoms):
-        o = _skip_zero_padding(d, o)
         if o + 4 > len(d):
             break
         raw_len = struct.unpack_from("<I", d, o)[0]
         o += 4
-        if raw_len <= 0 or raw_len > 500:
+        if raw_len < 0 or raw_len > 500:
             o -= 4
+            continue
+        if raw_len == 0:
             continue
         o += raw_len * 2
     return o
@@ -345,14 +348,16 @@ def _parse_objects(data, start_off, nobj):
         sub_atoms = []
         sub_off = best_start
         for _ in range(natoms_f):
-            sub_off = _skip_zero_padding(d, sub_off)
             if sub_off + 4 > len(d):
                 break
             al = struct.unpack_from("<I", d, sub_off)[0]
             sub_off += 4
-            if al <= 0 or al > 500:
+            if al < 0 or al > 500:
                 sub_atoms.append("")
                 sub_off -= 4
+                continue
+            if al == 0:
+                sub_atoms.append("")
                 continue
             sz = al * 2
             if sub_off + sz > len(d):
