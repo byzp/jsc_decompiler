@@ -7,7 +7,30 @@ nested object parsing. Returns DisasmFunc — no decompiler dependency.
 import struct
 from ..utils import u32le
 from .codegen import parse_code
+import re as _re
+
 from disasm import DisasmFunc
+import re as _re
+
+_ESCAPE_CLEANUP = _re.compile(r"\\([+=:;,.|/])")
+
+
+def _clean_regex_source(src):
+    src = _ESCAPE_CLEANUP.sub(r"\1", src)
+    parts = []
+    in_class = False
+    for ch in src:
+        if ch == "[" and not in_class:
+            in_class = True
+            parts.append(ch)
+        elif ch == "]" and in_class:
+            in_class = False
+            parts.append(ch)
+        elif ch == "/" and not in_class:
+            parts.append("\\/")
+        else:
+            parts.append(ch)
+    return "".join(parts)
 
 
 def parse(data):
@@ -19,13 +42,98 @@ def parse(data):
         try:
             atoms_end = _find_atoms_end(data, func, code_end)
             consts_end = _find_consts_end(data, func, atoms_end)
-            func.children = _parse_objects(data, consts_end, func.nobj)
+            func.children, sub_off = _parse_objects(data, consts_end, func.nobj)
             for _ch in func.children:
                 if _ch is not None:
                     _ch.parent = func
         except Exception:
-            pass
+            sub_off = None
+    else:
+        atoms_end = _find_atoms_end(data, func, code_end)
+        sub_off = _find_consts_end(data, func, atoms_end)
+    if func.nreg > 0 and sub_off is not None:
+        regexps = []
+        o = sub_off
+        for _ in range(func.nreg):
+            if o + 4 > len(data):
+                break
+            rl = struct.unpack_from("<I", data, o)[0]
+            o += 4
+            if rl == 0:
+                regexps.append("")
+                continue
+            sz = rl * 2
+            if o + sz > len(data):
+                regexps.append("")
+                break
+            try:
+                src = data[o : o + sz].decode("utf-16le")
+            except UnicodeDecodeError:
+                src = ""
+            o += sz
+            if o + 4 > len(data):
+                regexps.append(src)
+                break
+            flags = struct.unpack_from("<I", data, o)[0]
+            o += 4
+            suffix = ""
+            if flags & 0x02:
+                suffix += "g"
+            if flags & 0x04:
+                suffix += "i"
+            if flags & 0x08:
+                suffix += "m"
+            if flags & 0x10:
+                suffix += "y"
+            regexps.append(f"/{_clean_regex_source(src)}/{suffix}")
+        func.regexps = regexps
+    _restructure_children(func)
     return func
+
+
+def _restructure_children(func):
+    """Promote non-lambda-owned nested children to be siblings.
+
+    In the Cocos51 binary, nobj counts ALL inner objects including
+    BlockObject/WithObject. The parser places them all as children.
+    But lambda/deffun idx only indexes JSFunction objects that are
+    directly referenced by the parent's own lambda/deffun ops.
+
+    Non-lambda-owned children (BlockObject etc.) should be promoted
+    to be siblings at the parent level so that lambda idx correctly
+    indexes only the lambda-owned children.
+    """
+    _restructure_recursive(func)
+
+
+def _restructure_recursive(func):
+    for child in func.children:
+        if child is not None:
+            _restructure_recursive(child)
+
+    new_children = []
+    for child in func.children:
+        if child is None:
+            new_children.append(child)
+            continue
+        lambda_indices = set()
+        for op in child.ops:
+            if op["nm"] in ("lambda", "deffun", "lambda_arrow"):
+                lambda_indices.add(op["params"].get("idx", -1))
+        lambda_owned_count = len(lambda_indices)
+        if child.nobj > lambda_owned_count and lambda_owned_count < len(child.children):
+            keep = child.children[:lambda_owned_count]
+            promote = child.children[lambda_owned_count:]
+            child.children = keep
+            child.nobj = lambda_owned_count
+            new_children.append(child)
+            for p in promote:
+                if p is not None:
+                    p.parent = func
+                new_children.append(p)
+        else:
+            new_children.append(child)
+    func.children = new_children
 
 
 def _parse_header(data):
@@ -70,6 +178,16 @@ def _is_sentinel(d, o):
         and struct.unpack_from("<I", d, o)[0] == 0
         and struct.unpack_from("<I", d, o + 4)[0] == 0xFFFFFFFF
     )
+
+
+def _find_next_sentinel(d, start_off, max_search=5000):
+    for i in range(start_off, min(start_off + max_search, len(d) - 8)):
+        if (
+            struct.unpack_from("<I", d, i)[0] == 0
+            and struct.unpack_from("<I", d, i + 4)[0] == 0xFFFFFFFF
+        ):
+            return i
+    return None
 
 
 def _skip_zero_padding(d, o):
@@ -191,20 +309,16 @@ def _find_consts_end(data, func, atoms_end):
 def _parse_objects(data, start_off, nobj):
     d = data
     if nobj <= 0 or nobj > 500:
-        return []
+        return [], start_off
 
     o = start_off
     objects = []
 
     for obj_idx in range(nobj):
-        found = False
-        for search in range(o, min(o + (len(d) - o), len(d) - 12)):
-            if u32le(d, search) == 0 and u32le(d, search + 4) == 0xFFFFFFFF:
-                o = search + 8
-                found = True
-                break
-        if not found:
+        sentinel_off = _find_next_sentinel(d, o)
+        if sentinel_off is None:
             break
+        o = sentinel_off + 8
 
         if o + 8 > len(d):
             break
@@ -279,6 +393,12 @@ def _parse_objects(data, start_off, nobj):
             slot_count += 1
             if slot_count > 100:
                 break
+        aliased_flags = []
+        for si in range(slot_count):
+            if var_slots_end + si < len(d):
+                aliased_flags.append(bool(d[var_slots_end + si] & 1))
+            else:
+                aliased_flags.append(False)
         var_slots_end += slot_count
         code_start = var_slots_end + 16
         if code_start + codelen > len(d):
@@ -287,6 +407,8 @@ def _parse_objects(data, start_off, nobj):
         nargs = (fields[0] >> 16) & 0xFFFF
         argvs = var_slot_names[:nargs] if nargs > 0 and var_slot_names else []
 
+        nconst_f = fields[9]
+
         func = DisasmFunc()
         func.name = atom_name
         func.nargs = nargs
@@ -294,59 +416,22 @@ def _parse_objects(data, start_off, nobj):
         func.codelen = codelen
         func.natoms = natoms_f
         func.nsrc = fields[5]
-        func.nconst = 0
+        func.nconst = nconst_f
         func.nobj = nobjects_f
         func.sbits = fields[12]
         func.argvs = argvs
         func.var_slot_names = var_slot_names
+        func.aliased_flags = aliased_flags
+        func.aliased_slot_offset = 2
         func.is_cocos = True
 
         if codelen > 0:
             func.ops = parse_code(d, code_start, code_start + codelen)
 
-        nsrc = func.nsrc
-        search_start = max(code_start + codelen, code_start + codelen + nsrc - 30)
-        max_atom_bytes = natoms_f * 1004 + 200
-        search_end = min(
-            len(d) - 20,
-            max(
-                code_start + codelen + nsrc + 50,
-                code_start + codelen + nsrc + max_atom_bytes,
-            ),
-        )
-        atom_start = search_start
-        best_start = atom_start
-        best_count = 0
-        while atom_start < search_end:
-            temp = atom_start
-            count = 0
-            for _ in range(natoms_f + 4):
-                temp = _skip_zero_padding(d, temp)
-                if temp + 4 > len(d):
-                    break
-                al = struct.unpack_from("<I", d, temp)[0]
-                if not (1 <= al <= 200):
-                    break
-                sz = al * 2
-                if temp + 4 + sz > len(d):
-                    break
-                try:
-                    s = d[temp + 4 : temp + 4 + sz].decode("utf-16le")
-                    if not s or len(s) != al:
-                        break
-                except:
-                    break
-                count += 1
-                temp = temp + 4 + sz
-            if count > best_count:
-                best_count = count
-                best_start = atom_start
-            if count >= min(3, natoms_f):
-                break
-            atom_start += 1
+        atom_start = code_start + codelen + func.nsrc
 
         sub_atoms = []
-        sub_off = best_start
+        sub_off = atom_start
         for _ in range(natoms_f):
             if sub_off + 4 > len(d):
                 break
@@ -370,13 +455,89 @@ def _parse_objects(data, start_off, nobj):
             sub_off += sz
         func.atoms = sub_atoms
 
+        nregexp_f = fields[8] if len(fields) > 8 else 0
+
+        # Child layout after atoms: nested objects → regexps → const pool.
         if nobjects_f > 0:
-            func.children = _parse_objects(d, sub_off, nobjects_f)
+            sentinel_off = _find_next_sentinel(d, sub_off)
+            if sentinel_off is not None:
+                sub_off = sentinel_off
+            func.children, sub_off = _parse_objects(d, sub_off, nobjects_f)
             for _ch in func.children:
                 if _ch is not None:
                     _ch.parent = func
 
-        objects.append(func)
-        o = code_start + codelen
+        if nregexp_f > 0:
+            regexps = []
+            for _ in range(nregexp_f):
+                if sub_off + 4 > len(d):
+                    break
+                rl = struct.unpack_from("<I", d, sub_off)[0]
+                sub_off += 4
+                if rl == 0:
+                    regexps.append("")
+                    continue
+                sz = rl * 2
+                if sub_off + sz > len(d):
+                    regexps.append("")
+                    break
+                try:
+                    src = d[sub_off : sub_off + sz].decode("utf-16le")
+                except UnicodeDecodeError:
+                    src = ""
+                sub_off += sz
+                if sub_off + 4 > len(d):
+                    regexps.append(src)
+                    break
+                flags = struct.unpack_from("<I", d, sub_off)[0]
+                sub_off += 4
+                suffix = ""
+                if flags & 0x02:
+                    suffix += "g"
+                if flags & 0x04:
+                    suffix += "i"
+                if flags & 0x08:
+                    suffix += "m"
+                if flags & 0x10:
+                    suffix += "y"
+                regexps.append(f"/{_clean_regex_source(src)}/{suffix}")
+            func.regexps = regexps
 
-    return objects
+        # Const pool: 4-byte LE type tag + payload, terminated by object
+        # sentinel.  0=int(4B), 1=double(8B), 2=string(len+utf16), 3/4/5/7=
+        # singleton values (no payload).  Indexed by `double`/const opcodes.
+        sub_consts = []
+        for _ in range(nconst_f):
+            if sub_off + 4 > len(d) or _is_sentinel(d, sub_off):
+                break
+            ct = struct.unpack_from("<I", d, sub_off)[0]
+            sub_off += 4
+            if ct == 0 and sub_off + 4 <= len(d):
+                sub_consts.append(("int", struct.unpack_from("<I", d, sub_off)[0]))
+                sub_off += 4
+            elif ct == 1 and sub_off + 8 <= len(d):
+                sub_consts.append(("double", struct.unpack_from("<d", d, sub_off)[0]))
+                sub_off += 8
+            elif ct == 2 and sub_off + 4 <= len(d):
+                rl = struct.unpack_from("<I", d, sub_off)[0]
+                sub_off += 4
+                if sub_off + rl * 2 <= len(d):
+                    sub_consts.append(
+                        (
+                            "atom",
+                            d[sub_off : sub_off + rl * 2].decode(
+                                "utf-16le", errors="replace"
+                            ),
+                        )
+                    )
+                    sub_off += rl * 2
+            elif ct in (3, 4, 5, 7):
+                sub_consts.append(("val", ct))
+            else:
+                break
+        func.consts = sub_consts
+
+        objects.append(func)
+        o = sub_off
+
+    return objects, o

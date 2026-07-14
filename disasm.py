@@ -29,10 +29,12 @@ class DisasmFunc:
         "consts",
         "ops",
         "children",
+        "flat_children",
         "source_path",
         "source_text",
         "is_cocos",
         "parent",
+        "regexps",
     )
 
     def __init__(self):
@@ -56,10 +58,23 @@ class DisasmFunc:
         self.consts = []
         self.ops = []
         self.children = []
+        self.flat_children = None
         self.source_path = ""
         self.source_text = ""
         self.is_cocos = False
         self.parent = None
+        self.regexps = []
+
+    def get_flat_children(self):
+        if self.flat_children is not None:
+            return self.flat_children
+        flat = []
+        for child in self.children:
+            flat.append(child)
+            if child is not None:
+                flat.extend(child.get_flat_children())
+        self.flat_children = flat
+        return flat
 
     def to_text(self):
         lines = []

@@ -51,7 +51,6 @@ def _decompile_func(func, dump_bytecode=False, parent_func=None):
     nested_results = []
     for child in func.children:
         if child is None:
-            # Placeholder for non-JSFunction objects (Block, With, JSObj)
             nested_results.append("")
             continue
         nested_results.append(_decompile_func(child, dump_bytecode, parent_func=func))
@@ -84,7 +83,6 @@ def _assemble_output(func, nested_results, body):
             if idx >= len(nested_results):
                 break
             if child is None:
-                # Non-JSFunction object (Block, With, JSObj) — skip
                 continue
             child_body = nested_results[idx].replace("\n// source:", "")
             child_body = child_body.strip()

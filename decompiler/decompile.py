@@ -7,9 +7,93 @@ _OBJECT_LITERAL_SKIP = object()
 
 import re as _re
 
+# Ops with no side effects usable inside a ternary branch (then/else value),
+# grouped by stack effect.  Anything outside these sets disqualifies the
+# branch from ternary conversion.
+_TERNARY_PUSH_OPS = frozenset(
+    [
+        "string",
+        "double",
+        "int8",
+        "int32",
+        "uint16",
+        "uint24",
+        "zero",
+        "one",
+        "null",
+        "true",
+        "false",
+        "undefined",
+        "this",
+        "hole",
+        "regexp",
+        "getlocal",
+        "calllocal",
+        "getarg",
+        "callarg",
+        "getaliasedvar",
+        "callaliasedvar",
+        "name",
+        "bindname",
+        "getgname",
+        "callintrinsic",
+        "lambda",
+        "lambda_arrow",
+    ]
+)
+_TERNARY_UNARY_OPS = frozenset(
+    [
+        "getprop",
+        "callprop",
+        "length",
+        "not",
+        "bitnot",
+        "neg",
+        "pos",
+        "tostring",
+        "typeof",
+        "typeofexpr",
+    ]
+)
+_TERNARY_BINARY_OPS = frozenset(
+    [
+        "add",
+        "sub",
+        "mul",
+        "div",
+        "mod",
+        "bitand",
+        "bitor",
+        "bitxor",
+        "lsh",
+        "rsh",
+        "ursh",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "stricteq",
+        "strictne",
+        "in",
+        "instanceof",
+        "getelem",
+        "callelem",
+    ]
+)
+
 
 def _is_numeric(s):
     return bool(_re.match(r"^-?\d+(\.\d+)?$", s))
+
+
+def _is_ident_only(s):
+    return bool(_re.match(r"^[A-Za-z_$][A-Za-z0-9_$]*$", s))
+
+
+def _has_bare_assignment(s):
+    return bool(_re.search(r"(?<!=)=(?!=)", s))
 
 
 def _js_str(s):
@@ -20,9 +104,10 @@ def _js_str(s):
     return json.dumps(s, ensure_ascii=True)
 
 
-def _infer_var_name(val, slot, var_slot_names):
-    if slot < len(var_slot_names):
-        vsn = var_slot_names[slot]
+def _infer_var_name(val, slot, var_slot_names, nargs=0):
+    idx = nargs + slot
+    if idx < len(var_slot_names):
+        vsn = var_slot_names[idx]
         if vsn:
             return vsn
     return f"_var_{slot}"
@@ -74,7 +159,7 @@ class DecompileEngine:
             0  # number of ops to skip (Cocos expanded inc/dec sequences)
         )
         self._pending_logic = (
-            None  # pending and/or condition to combine with next ifeq/ifne
+            None  # pending and/or condition to combine with next ifeq/ifne or value use
         )
         self._switch_labels = {}  # target_offset → 'case val:' / 'default:'
         self._switch_stack = (
@@ -84,9 +169,20 @@ class DecompileEngine:
         self._switch_default_target = 0
         self._switch_ifs_start = 0
 
+        self._nargs = (
+            func.nargs
+            if hasattr(func, "nargs")
+            else len(func.argvs) if hasattr(func, "argvs") else 0
+        )
+
         # Pre-populate local_vars from var_slot_names
+        # localno indexes into local vars only, NOT args
+        # var_slot_names = [arg0, arg1, ..., local0, local1, ...]
+        # so localno=N maps to var_slot_names[nargs + N]
+        # We store _local_vars keyed by the var_slot_names index
+        # so that getlocal localno=N looks up _local_vars[nargs+N]
         for vsi, vsname in enumerate(func.var_slot_names):
-            if vsname and vsi not in self._local_vars:
+            if vsname:
                 self._local_vars[vsi] = StackItem(name=vsname)
 
         # Iterator loop tracking
@@ -121,8 +217,12 @@ class DecompileEngine:
         self._while_open = (
             []
         )  # stack of open while loops: [(loophead_off, ifne_off, exit_goto_off)]
+        self._ternary_ifs = (
+            {}
+        )  # ifeq_offset → {else_off, after_off, cond, then_idx, else_idx, skip_count}
         self._build_iter_loop_map()
         self._build_while_loop_map()
+        self._build_ternary_map()
         self._prescan_deffun_names()
 
     def _build_iter_loop_map(self):
@@ -249,6 +349,134 @@ class DecompileEngine:
                             self._while_loop_exits.add(ops[k + 1]["off"])
                     break
 
+    def _branch_stack_effect(self, start, end):
+        """Net stack effect of ops[start:end] if all are expression-value ops
+        (no statement-level side effects like stores/pops/branches); None if
+        any op is disallowed or would consume values pushed before ``start``.
+        Calls are allowed: in value position the ternary keeps the original
+        evaluate-only-taken-branch semantics."""
+        depth = 0
+        j = start
+        while j < end:
+            op = self.d.ops[j]
+            nm_j = op["nm"]
+            if nm_j == "ifeq" and op["off"] in self._ternary_ifs:
+                # Nested ternary already mapped (built innermost-first):
+                # consumes the condition, pushes one value, spans to after_idx
+                if depth < 1:
+                    return None
+                j += self._ternary_ifs[op["off"]]["skip_count"] + 1
+                continue
+            j += 1
+            if nm_j == "implicitthis":
+                if not self.d.is_cocos:
+                    depth += 1
+                continue
+            if nm_j in NOOP_NAMES:
+                continue
+            if nm_j in _TERNARY_PUSH_OPS:
+                depth += 1
+            elif nm_j in ("callname", "callgname"):
+                depth += 2  # callee + implicit this
+            elif nm_j in _TERNARY_UNARY_OPS:
+                if depth < 1:
+                    return None
+            elif nm_j in _TERNARY_BINARY_OPS:
+                if depth < 2:
+                    return None
+                depth -= 1
+            elif nm_j == "dup":
+                if depth < 1:
+                    return None
+                depth += 1
+            elif nm_j == "swap":
+                if depth < 2:
+                    return None
+            elif nm_j in ("newinit", "newobject", "newarray", "newarray_copyonwrite"):
+                depth += 1
+            elif nm_j in ("setlocal", "setarg", "setaliasedvar"):
+                if depth < 1:
+                    return None
+            elif nm_j in (
+                "setprop",
+                "setname",
+                "setgname",
+                "setconst",
+                "initprop",
+                "initprop_getter",
+                "initprop_setter",
+                "initelem_array",
+                "arraypush",
+            ):
+                if depth < 2:
+                    return None
+                depth -= 1
+            elif nm_j in ("setelem", "initelem", "initelem_getter", "initelem_setter"):
+                if depth < 3:
+                    return None
+                depth -= 2
+            elif nm_j in ("call", "funcall", "eval", "funapply", "new"):
+                argc = op["params"].get("argc", 0)
+                if depth < argc + 2:
+                    return None
+                depth -= argc + 1
+            else:
+                return None
+        return depth
+
+    def _build_ternary_map(self):
+        """Pre-scan ops for ternary diamonds: ifeq → <pure then-value> →
+        goto after → <pure else-value> → after.  Both branches must push
+        exactly one value with no side effects.  Emitting these as if/else
+        statements loses the value (empty blocks) and breaks method-call
+        frames like obj.m(cond ? a : b) (dup+callprop+swap spanning the if)."""
+        ops = self.d.ops
+        n = len(ops)
+        # Innermost-first so nested diamonds are already mapped when the
+        # enclosing branch is validated
+        for i in range(n - 1, -1, -1):
+            if ops[i]["nm"] != "ifeq":
+                continue
+            offset = ops[i]["params"].get("offset", 0)
+            if offset <= 0:
+                continue
+            else_off = ops[i]["off"] + offset
+            else_idx = None
+            for j in range(i + 1, n):
+                if ops[j]["off"] >= else_off:
+                    if ops[j]["off"] == else_off:
+                        else_idx = j
+                    break
+            # Need at least one then-op plus the goto before the else branch
+            if else_idx is None or else_idx < i + 3:
+                continue
+            goto_idx = else_idx - 1
+            if ops[goto_idx]["nm"] != "goto":
+                continue
+            g_offset = ops[goto_idx]["params"].get("offset", 0)
+            if g_offset <= 0:
+                continue
+            after_off = ops[goto_idx]["off"] + g_offset
+            if after_off <= else_off:
+                continue
+            after_idx = None
+            for j in range(else_idx + 1, n):
+                if ops[j]["off"] >= after_off:
+                    if ops[j]["off"] == after_off:
+                        after_idx = j
+                    break
+            if after_idx is None:
+                continue
+            if self._branch_stack_effect(i + 1, goto_idx) != 1:
+                continue
+            if self._branch_stack_effect(else_idx, after_idx) != 1:
+                continue
+            self._ternary_ifs[ops[i]["off"]] = {
+                "then_rng": (i + 1, goto_idx),
+                "else_rng": (else_idx, after_idx),
+                "skip_count": after_idx - i - 1,
+            }
+
     def _prescan_deffun_names(self):
         """Pre-scan ops to find all deffun names, so defvar can skip them."""
         for op in self.d.ops:
@@ -283,6 +511,32 @@ class DecompileEngine:
     def _pop(self):
         return self._stack.pop() if self._stack else StackItem()
 
+    def _eval_range(self, start, end):
+        """Dispatch pure value ops ops[start:end] and return the single value
+        they push.  Used to materialize the branches of a ternary diamond.
+        Honors _skip_ops_count so nested ternary diamonds work."""
+        base = len(self._stack)
+        j = start
+        while j < end:
+            if self._skip_ops_count > 0:
+                self._skip_ops_count -= 1
+                j += 1
+                continue
+            self._dispatch(self.d.ops[j])
+            j += 1
+        val = self._pop().get_value() if self._stack else "undefined"
+        del self._stack[base:]  # discard any residue, keep pre-branch stack
+        return val
+
+    def _next_is_cond(self, offset, nm):
+        for si in range(len(self.d.ops)):
+            if self.d.ops[si]["off"] == offset and self.d.ops[si]["nm"] == nm:
+                return si + 1 < len(self.d.ops) and self.d.ops[si + 1]["nm"] in (
+                    "ifeq",
+                    "ifne",
+                )
+        return False
+
     def _resolve_aliased_var(self, hops, slot):
         """Resolve an aliased var (hops, slot) to a variable name.
 
@@ -292,8 +546,8 @@ class DecompileEngine:
         static scope chain; functions without captured bindings are transparent
         and skipped.  ``slot`` indexes the CallObject's dynamic slots, which
         begin after RESERVED_SLOTS (2: callee + enclosingScope) in MozJS34,
-        so the binding index into ``var_slot_names`` is
-        ``slot - aliased_slot_offset``.  Cocos51 uses direct indexing (offset=0).
+        so the aliased binding index is ``slot - 2``, which counts only bindings
+        whose aliased_flags bit is set.
         """
         chain = []
         f = self.d
@@ -310,9 +564,22 @@ class DecompileEngine:
         else:
             target = self.d
 
-        offset = getattr(target, "aliased_slot_offset", 0)
-        var_idx = slot - offset
+        offset = getattr(target, "aliased_slot_offset", 2)
+        aliased_idx = slot - offset
 
+        if aliased_idx >= 0:
+            aliased_flags = getattr(target, "aliased_flags", [])
+            count = 0
+            for i in range(len(target.var_slot_names)):
+                if i < len(aliased_flags) and aliased_flags[i]:
+                    if count == aliased_idx:
+                        nm = target.var_slot_names[i]
+                        if nm:
+                            return nm
+                        break
+                    count += 1
+
+        var_idx = slot - offset
         if target is self.d and var_idx >= 0:
             lv = self._local_vars.get(var_idx)
             if lv and lv.name:
@@ -325,7 +592,7 @@ class DecompileEngine:
 
         parent = getattr(target, "parent", None)
         while parent is not None:
-            p_offset = getattr(parent, "aliased_slot_offset", 0)
+            p_offset = getattr(parent, "aliased_slot_offset", 2)
             p_idx = slot - p_offset
             if 0 <= p_idx < len(parent.var_slot_names):
                 return parent.var_slot_names[p_idx]
@@ -525,6 +792,11 @@ class DecompileEngine:
             if self._stack:
                 rv = self._pop()
                 val = rv.get_value()
+                if self._pending_logic is not None and val:
+                    op, lhs = self._pending_logic
+                    self._pending_logic = None
+                    rhs = f"({val})" if _has_bare_assignment(val) else val
+                    val = f"({lhs} {op} {rhs})"
                 if val and val != "undefined":
                     self._w(o, "return " + val + ";")
                 else:
@@ -546,17 +818,27 @@ class DecompileEngine:
                 self._open_ifs.clear()
                 self._w(o, "}" * close_count)
         elif nm in ("pop", "popv", "setrval"):
-            rv = self._pop()
             if self._skip_next_pop:
                 self._skip_next_pop = False
                 return
+            rv = self._pop()
             if rv.type == "logic":
                 return
             s = rv.get_value()
-            # Skip pops that are part of iterator loop control flow
+            if self._pending_logic is not None and s:
+                op, lhs = self._pending_logic
+                self._pending_logic = None
+                rhs = f"({s})" if _has_bare_assignment(s) else s
+                s = f"({lhs} {op} {rhs})"
             if o in self._iter_pops:
                 pass
-            elif s and s != "undefined" and s != "void" and not s.startswith("(+"):
+            elif (
+                s
+                and s != "undefined"
+                and s != "void"
+                and not s.startswith("(+")
+                and not _is_ident_only(s)
+            ):
                 self._w(o, s + ";")
         elif nm == "popn":
             for _ in range(p.get("n", 0)):
@@ -598,11 +880,24 @@ class DecompileEngine:
             v = self._pop()
             tgt = o + p.get("offset", 0)
             cond = v.get_value()
-            if self._pending_logic is not None:
-                op, lhs = self._pending_logic
-                self._pending_logic = None
-                cond = f"({lhs} {op} {cond})"
-            if p.get("offset", 0) > 0:
+            if o in self._ternary_ifs:
+                info = self._ternary_ifs[o]
+                then_val = self._eval_range(*info["then_rng"])
+                else_val = self._eval_range(*info["else_rng"])
+                # Factor a common assignment target: cond ? a=x : a=y → a = (cond ? x : y)
+                asn = _re.compile(r"^([A-Za-z_$][\w$.]*)=(?!=)(.*)$", _re.S)
+                mt, me = asn.match(then_val), asn.match(else_val)
+                if mt and me and mt.group(1) == me.group(1):
+                    self._push(
+                        tp="script",
+                        script=f"{mt.group(1)}=({cond} ? {mt.group(2)} : {me.group(2)})",
+                    )
+                else:
+                    self._push(
+                        tp="script", script=f"({cond} ? {then_val} : {else_val})"
+                    )
+                self._skip_ops_count = info["skip_count"]
+            elif p.get("offset", 0) > 0:
                 self._w(o, f"if ({cond}) {{")
                 self._open_ifs.append((o, tgt))
                 self.branch_map[o] = {"goto": tgt, "type": "if"}
@@ -614,10 +909,6 @@ class DecompileEngine:
             v = self._pop()
             tgt = o + p.get("offset", 0)
             cond = v.get_value()
-            if self._pending_logic is not None:
-                op, lhs = self._pending_logic
-                self._pending_logic = None
-                cond = f"({lhs} {op} {cond})"
             if o in self._iter_ifnes:
                 pass
             elif o in self._while_loop_ifnes:
@@ -711,7 +1002,7 @@ class DecompileEngine:
                         for iternext_off, info in self._iter_loops.items():
                             iter_off = info["iter_off"]
                             end_off = info["loop_end_off"]
-                            if iter_off < if_off < end_off:
+                            if end_off is not None and iter_off < if_off < end_off:
                                 inside_iter = True
                                 break
                         if inside_iter:
@@ -778,21 +1069,34 @@ class DecompileEngine:
                     self._w(tgt, "}" * close_count)
         elif nm == "or":
             v = self._pop()
-            self._pending_logic = ("||", v.get_value())
-            self._skip_next_pop = True
+            rhs = v.get_value()
+            if self._pending_logic is not None and rhs:
+                op0, lhs = self._pending_logic
+                self._pending_logic = (op0, f"({lhs} {op0} {rhs})")
+            else:
+                self._pending_logic = ("||", rhs)
+            self._push(tp="logic")
         elif nm == "and":
             v = self._pop()
-            self._pending_logic = ("&&", v.get_value())
-            self._skip_next_pop = True
+            rhs = v.get_value()
+            if self._pending_logic is not None and rhs:
+                op0, lhs = self._pending_logic
+                self._pending_logic = (op0, f"({lhs} {op0} {rhs})")
+            else:
+                self._pending_logic = ("&&", rhs)
+            self._push(tp="logic")
 
         # function calls
         elif nm in ("call", "new", "funcall", "eval", "funapply"):
             argc = p.get("argc", 0)
             argv = [self._pop() for _ in range(argc)]
-            # After args, next is thisArg, then callee
             this_ = self._pop()
             callee = self._pop()
             fn = callee.name if callee.name is not None else callee.get_value()
+            this_val = this_.get_value()
+            callee_val = callee.get_value()
+            if nm != "new" and this_val and callee_val.startswith(this_val + "."):
+                fn = callee_val
             args = ",".join(a.get_value() for a in reversed(argv))
             pre = "new " if nm == "new" else ""
             call_str = pre + fn + "(" + args + ")"
@@ -803,6 +1107,10 @@ class DecompileEngine:
             this_ = self._pop()
             callee = self._pop()
             fn = callee.name if callee.name is not None else callee.get_value()
+            this_val = this_.get_value()
+            callee_val = callee.get_value()
+            if nm not in ("spreadnew",) and this_val.startswith(callee_val + "."):
+                fn = this_val
             args = ",".join(a.get_value() for a in reversed(argv))
             pre = "new " if nm == "spreadnew" else ""
             call_str = pre + fn + "(" + args + ")"
@@ -827,15 +1135,7 @@ class DecompileEngine:
                 fv = str(val.value) if val.value is not None else ""
                 if not fv.startswith("__L_"):
                     val_str = "function(){ " + val_str + " }"
-            next_is_cond = False
-            for si in range(len(self.d.ops)):
-                if self.d.ops[si]["off"] == o and self.d.ops[si]["nm"] == "setprop":
-                    if si + 1 < len(self.d.ops) and self.d.ops[si + 1]["nm"] in (
-                        "ifeq",
-                        "ifne",
-                    ):
-                        next_is_cond = True
-                    break
+            next_is_cond = self._next_is_cond(o, "setprop")
             if next_is_cond:
                 self._push(tp="script", script=f"({ov}{aname_expr}=== {val_str})")
             else:
@@ -958,36 +1258,55 @@ class DecompileEngine:
                 item = StackItem(tp="script", name=name, script=name)
                 self._push(**item.copy())
                 return
-            self._push(tp="script", name=name, script=f"{name}={val.get_value()}")
+            if self._next_is_cond(o, "setarg"):
+                self._push(
+                    tp="script", name=name, script=f"({name}=== {val.get_value()})"
+                )
+            else:
+                self._push(tp="script", name=name, script=f"{name}={val.get_value()}")
         elif nm == "getlocal" or nm == "calllocal":
             ln = p.get("localno", 0)
-            lv = self._local_vars.get(ln)
+            vln = self._nargs + ln
+            lv = self._local_vars.get(vln)
             if lv:
                 self._push(name=lv.name)
             else:
                 name = (
-                    self.d.var_slot_names[ln]
-                    if ln < len(self.d.var_slot_names) and self.d.var_slot_names[ln]
+                    self.d.var_slot_names[vln]
+                    if vln < len(self.d.var_slot_names) and self.d.var_slot_names[vln]
                     else f"_var_{ln}"
                 )
                 self._push(name=name)
         elif nm == "setlocal":
             val = self._pop()
             ln = p.get("localno", 0)
+            vln = self._nargs + ln
             self._assigned_local_slots.add(ln)
             if (
                 self._iter_suppress_setlocal is not None
                 and self._iter_suppress_setlocal == ln
             ):
                 self._iter_suppress_setlocal = None
-                name = _infer_var_name(val, ln, self.d.var_slot_names)
+                name = _infer_var_name(val, ln, self.d.var_slot_names, self._nargs)
                 item = StackItem(tp="script", name=name, script=name)
-                self._local_vars[ln] = item
+                self._local_vars[vln] = item
                 self._push(**item.copy())
                 return
-            name = _infer_var_name(val, ln, self.d.var_slot_names)
-            item = StackItem(tp="script", name=name, script=f"{name}={val.get_value()}")
-            self._local_vars[ln] = item
+            name = _infer_var_name(val, ln, self.d.var_slot_names, self._nargs)
+            if name == "arguments" and val.get_value() == "arguments":
+                item = StackItem(tp="script", name=name, script=name)
+                self._local_vars[vln] = item
+                self._push(**item.copy())
+                return
+            if self._next_is_cond(o, "setlocal"):
+                item = StackItem(
+                    tp="script", name=name, script=f"({name}=== {val.get_value()})"
+                )
+            else:
+                item = StackItem(
+                    tp="script", name=name, script=f"{name}={val.get_value()}"
+                )
+            self._local_vars[vln] = item
             self._push(**item.copy())
 
         # inc/dec arg/local/prop/elem shortcuts
@@ -1037,8 +1356,9 @@ class DecompileEngine:
             elif nm in ("inclocal", "declocal", "localinc", "localdec"):
                 ln = p.get("localno", 0)
                 is_cocos = getattr(self.d, "is_cocos", False)
-                if is_cocos and not is_prefix:
+                if is_cocos:
                     skip = False
+                    skip_count = 0
                     ops = self.d.ops
                     for si in range(len(ops)):
                         if ops[si]["off"] == o and ops[si]["nm"] == nm:
@@ -1062,32 +1382,50 @@ class DecompileEngine:
                                     and seq[8] == "pop"
                                 ):
                                     skip = True
+                                    skip_count = 8
+                                    ln = slocals[1]
+                                elif (
+                                    si + 7 < len(ops)
+                                    and seq[0] == "pop"
+                                    and seq[1] == "getlocal"
+                                    and seq[2] == "pos"
+                                    and seq[3] == "one"
+                                    and seq[4] == arith
+                                    and seq[5] == "setlocal"
+                                    and slocals[5] == slocals[1]
+                                    and seq[6] == "pop"
+                                ):
+                                    skip = True
+                                    skip_count = 6
                                     ln = slocals[1]
                             break
                     if skip:
                         self._assigned_local_slots.add(ln)
-                        lv = self._local_vars.get(ln)
+                        vln = self._nargs + ln
+                        lv = self._local_vars.get(vln)
                         name = (
                             lv.name
                             if lv
                             else (
-                                self.d.var_slot_names[ln]
-                                if ln < len(self.d.var_slot_names)
-                                and self.d.var_slot_names[ln]
+                                self.d.var_slot_names[vln]
+                                if vln < len(self.d.var_slot_names)
+                                and self.d.var_slot_names[vln]
                                 else f"_var_{ln}"
                             )
                         )
                         self._push(tp="script", script=f"({name}{op})")
-                        self._skip_ops_count = 8
+                        self._skip_ops_count = skip_count
                         return
                 self._assigned_local_slots.add(ln)
-                lv = self._local_vars.get(ln)
+                vln = self._nargs + ln
+                lv = self._local_vars.get(vln)
                 name = (
                     lv.name
                     if lv
                     else (
-                        self.d.var_slot_names[ln]
-                        if ln < len(self.d.var_slot_names) and self.d.var_slot_names[ln]
+                        self.d.var_slot_names[vln]
+                        if vln < len(self.d.var_slot_names)
+                        and self.d.var_slot_names[vln]
                         else f"_var_{ln}"
                     )
                 )
@@ -1151,6 +1489,43 @@ class DecompileEngine:
                 "gnamedec",
             ):
                 name = self._push_name(p.get("idx", 0))
+                is_cocos_name = getattr(self.d, "is_cocos", False) and nm in (
+                    "incname",
+                    "decname",
+                )
+                if is_cocos_name:
+                    skip = False
+                    skip_count = 0
+                    ops = self.d.ops
+                    for si in range(len(ops)):
+                        if ops[si]["off"] == o and ops[si]["nm"] == nm:
+                            if si + 7 < len(ops):
+                                seq = [ops[si + k]["nm"] for k in range(1, 8)]
+                                sidxs = [
+                                    ops[si + k].get("params", {}).get("idx", -1)
+                                    for k in range(1, 8)
+                                ]
+                                arith = "add" if is_inc else "sub"
+                                if (
+                                    seq[0] == "pop"
+                                    and seq[1] in ("bindname", "name")
+                                    and seq[2] == "name"
+                                    and seq[3] in ("pos", "dup")
+                                    and seq[4] == "one"
+                                    and seq[5] == arith
+                                    and seq[6] == "setname"
+                                    and sidxs[6] == sidxs[1]
+                                ):
+                                    skip = True
+                                    skip_count = 7
+                            break
+                    if skip:
+                        if is_prefix:
+                            self._push(tp="script", script=f"{op}{name}")
+                        else:
+                            self._push(tp="script", script=f"({name}{op})")
+                        self._skip_ops_count = skip_count
+                        return
                 if is_prefix:
                     self._push(tp="script", script=f"{op}{name}")
                 else:
@@ -1270,9 +1645,12 @@ class DecompileEngine:
             var_name = self._resolve_aliased_var(p.get("hops", 0), p.get("slot", 0))
             if not var_name:
                 var_name = f'_av{p.get("slot", 0)}'
-            self._push(
-                tp="script", name=var_name, script=f"{var_name}={val.get_value()}"
-            )
+            if var_name == "arguments" and val.get_value() == "arguments":
+                self._push(tp="script", name=var_name, script=var_name)
+            else:
+                self._push(
+                    tp="script", name=var_name, script=f"{var_name}={val.get_value()}"
+                )
 
         # literals
         elif nm == "string":
@@ -1310,7 +1688,12 @@ class DecompileEngine:
         elif nm == "hole":
             self._push(tp="void", value=None)
         elif nm == "regexp":
-            self._push(tp="regexp", value="/re/")
+            idx = p.get("idx", 0)
+            regexps = getattr(self.d, "regexps", None)
+            if regexps and idx < len(regexps):
+                self._push(tp="regexp", value=regexps[idx])
+            else:
+                self._push(tp="regexp", value="/re/")
 
         # arithmetic / comparisons
         elif nm in IMAGE_OPS:
@@ -1652,14 +2035,15 @@ class DecompileEngine:
                         next_op = ops[si + 1]
                         if next_op["nm"] == "setlocal":
                             ln = next_op["params"].get("localno", 0)
-                            lv = self._local_vars.get(ln)
+                            vln = self._nargs + ln
+                            lv = self._local_vars.get(vln)
                             loop_var = (
                                 lv.name
                                 if lv
                                 else (
-                                    self.d.var_slot_names[ln]
-                                    if ln < len(self.d.var_slot_names)
-                                    and self.d.var_slot_names[ln]
+                                    self.d.var_slot_names[vln]
+                                    if vln < len(self.d.var_slot_names)
+                                    and self.d.var_slot_names[vln]
                                     else f"_var_{ln}"
                                 )
                             )
@@ -1694,14 +2078,15 @@ class DecompileEngine:
                                 op4 = ops[si + 4]  # setlocal
                                 if op3["nm"] == "getelem" and op4["nm"] == "setlocal":
                                     ln = op4["params"].get("localno", 0)
-                                    lv = self._local_vars.get(ln)
+                                    vln = self._nargs + ln
+                                    lv = self._local_vars.get(vln)
                                     loop_var = (
                                         lv.name
                                         if lv
                                         else (
-                                            self.d.var_slot_names[ln]
-                                            if ln < len(self.d.var_slot_names)
-                                            and self.d.var_slot_names[ln]
+                                            self.d.var_slot_names[vln]
+                                            if vln < len(self.d.var_slot_names)
+                                            and self.d.var_slot_names[vln]
                                             else f"_var_{ln}"
                                         )
                                     )
