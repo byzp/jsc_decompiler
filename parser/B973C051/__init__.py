@@ -41,16 +41,14 @@ def parse(data):
     if func.nobj > 0:
         try:
             atoms_end = _find_atoms_end(data, func, code_end)
-            consts_end = _find_consts_end(data, func, atoms_end)
-            func.children, sub_off = _parse_objects(data, consts_end, func.nobj)
+            func.children, sub_off = _parse_objects(data, atoms_end, func.nobj)
             for _ch in func.children:
                 if _ch is not None:
                     _ch.parent = func
         except Exception:
             sub_off = None
     else:
-        atoms_end = _find_atoms_end(data, func, code_end)
-        sub_off = _find_consts_end(data, func, atoms_end)
+        sub_off = _find_atoms_end(data, func, code_end)
     if func.nreg > 0 and sub_off is not None:
         regexps = []
         o = sub_off
@@ -87,6 +85,19 @@ def parse(data):
                 suffix += "y"
             regexps.append(f"/{_clean_regex_source(src)}/{suffix}")
         func.regexps = regexps
+        sub_off = o
+    # Root const pool sits after objects/regexps (like sub-functions), with
+    # optional 12-byte try-note records before it.  Parse with validation.
+    if func.nconst > 0 and sub_off is not None:
+        candidates = []
+        if 0 < func.ntry <= 100:
+            candidates.append(sub_off + func.ntry * 12)
+        candidates.append(sub_off)
+        for cand in candidates:
+            res = _parse_const_pool(data, cand, func.nconst)
+            if res is not None:
+                func.consts, sub_off = res
+                break
     _restructure_children(func)
     return func
 
@@ -154,10 +165,12 @@ def _parse_header(data):
     func.nvars = u32le(data, 12)
     func.natoms = u32le(data, 20)
     func.nsrc = u32le(data, 24)
-    func.nconst = u32le(data, 28)
     func.nobj = u32le(data, 32)
     func.nreg = u32le(data, 36)
-    func.ntry = u32le(data, 40)
+    # Root nconst lives at offset 40 (verified against `double idx` usage);
+    # offset 28 appears to be the try-note count.
+    func.nconst = u32le(data, 40)
+    func.ntry = u32le(data, 28)
     func.nblk = u32le(data, 44)
     func.sbits = u32le(data, 56) if u32le(data, 56) < 0x10000 else 0
 
@@ -231,36 +244,6 @@ def _parse_atoms(data, func, code_end):
         o += sz
     func.atoms = atoms
 
-    nconst = func.nconst
-    consts = []
-    for _ in range(nconst):
-        if o >= len(d):
-            break
-        if _is_sentinel(d, o):
-            break
-        ct = d[o]
-        o += 1
-        if ct == 0 and o + 4 <= len(d):
-            consts.append(("int", struct.unpack_from("<I", d, o)[0]))
-            o += 4
-        elif ct == 1 and o + 8 <= len(d):
-            consts.append(("double", struct.unpack("<d", d[o : o + 8])[0]))
-            o += 8
-        elif ct == 2 and o + 5 <= len(d):
-            rl = struct.unpack_from("<I", d, o)[0]
-            o += 4
-            sz = rl * 2
-            if o + sz <= len(d):
-                consts.append(
-                    ("atom", d[o : o + sz].decode("utf-16le", errors="replace"))
-                )
-                o += sz
-        elif ct in (3, 4, 5, 7):
-            consts.append(("val", ct))
-        else:
-            consts.append(("unknown", ct))
-    func.consts = consts
-
 
 def _find_atoms_end(data, func, code_end):
     d = data
@@ -304,6 +287,40 @@ def _find_consts_end(data, func, atoms_end):
         else:
             break
     return o
+
+
+def _parse_const_pool(d, off, n):
+    """Parse n const-pool entries at off.  Entries are 4-byte LE type tag +
+    payload: 0=int(4B), 1=double(8B), 2=string(len+utf16), 3/4/5/7=singleton
+    values (no payload).  Returns (consts, end_off), or None if any entry is
+    malformed — used to validate candidate pool locations."""
+    consts = []
+    o = off
+    for _ in range(n):
+        if o + 4 > len(d) or _is_sentinel(d, o):
+            return None
+        ct = struct.unpack_from("<I", d, o)[0]
+        o += 4
+        if ct == 0 and o + 4 <= len(d):
+            consts.append(("int", struct.unpack_from("<I", d, o)[0]))
+            o += 4
+        elif ct == 1 and o + 8 <= len(d):
+            consts.append(("double", struct.unpack_from("<d", d, o)[0]))
+            o += 8
+        elif ct == 2 and o + 4 <= len(d):
+            rl = struct.unpack_from("<I", d, o)[0]
+            o += 4
+            if rl > 10000 or o + rl * 2 > len(d):
+                return None
+            consts.append(
+                ("atom", d[o : o + rl * 2].decode("utf-16le", errors="replace"))
+            )
+            o += rl * 2
+        elif ct in (3, 4, 5, 7):
+            consts.append(("val", ct))
+        else:
+            return None
+    return consts, o
 
 
 def _parse_objects(data, start_off, nobj):
@@ -503,38 +520,24 @@ def _parse_objects(data, start_off, nobj):
                 regexps.append(f"/{_clean_regex_source(src)}/{suffix}")
             func.regexps = regexps
 
-        # Const pool: 4-byte LE type tag + payload, terminated by object
-        # sentinel.  0=int(4B), 1=double(8B), 2=string(len+utf16), 3/4/5/7=
-        # singleton values (no payload).  Indexed by `double`/const opcodes.
+        # Try notes: fields[6] records of 12 bytes each (kind, stackDepth,
+        # start, length) sit between regexps and the const pool.  Their exact
+        # position varies, so parse the const pool with validation: prefer the
+        # offset past the try notes, fall back to the current offset, and if
+        # neither yields a clean pool leave sub_off untouched so sibling
+        # object discovery (sentinel search) is not disturbed.
+        ntry_f = fields[6]
         sub_consts = []
-        for _ in range(nconst_f):
-            if sub_off + 4 > len(d) or _is_sentinel(d, sub_off):
-                break
-            ct = struct.unpack_from("<I", d, sub_off)[0]
-            sub_off += 4
-            if ct == 0 and sub_off + 4 <= len(d):
-                sub_consts.append(("int", struct.unpack_from("<I", d, sub_off)[0]))
-                sub_off += 4
-            elif ct == 1 and sub_off + 8 <= len(d):
-                sub_consts.append(("double", struct.unpack_from("<d", d, sub_off)[0]))
-                sub_off += 8
-            elif ct == 2 and sub_off + 4 <= len(d):
-                rl = struct.unpack_from("<I", d, sub_off)[0]
-                sub_off += 4
-                if sub_off + rl * 2 <= len(d):
-                    sub_consts.append(
-                        (
-                            "atom",
-                            d[sub_off : sub_off + rl * 2].decode(
-                                "utf-16le", errors="replace"
-                            ),
-                        )
-                    )
-                    sub_off += rl * 2
-            elif ct in (3, 4, 5, 7):
-                sub_consts.append(("val", ct))
-            else:
-                break
+        if nconst_f > 0:
+            candidates = []
+            if 0 < ntry_f <= 100:
+                candidates.append(sub_off + ntry_f * 12)
+            candidates.append(sub_off)
+            for cand in candidates:
+                res = _parse_const_pool(d, cand, nconst_f)
+                if res is not None:
+                    sub_consts, sub_off = res
+                    break
         func.consts = sub_consts
 
         objects.append(func)
