@@ -139,6 +139,7 @@ class DecompileEngine:
         self._local_vars = {}
         self._assigned_local_slots = set()
         self._stack = []
+        self._rval = None
         self.script = {}
         self.branch_map = {}
         self.loop_entries = set()
@@ -784,8 +785,16 @@ class DecompileEngine:
 
         if nm == "implicitthis" and self.d.is_cocos:
             return
-        if nm in NOOP_NAMES:
+        if nm in NOOP_NAMES and nm != "retrval":
             return
+
+        is_retrval = nm == "retrval"
+        if is_retrval:
+            if self._rval is not None:
+                self._push(**self._rval.copy())
+            else:
+                self._push(tp="undefined", value="undefined")
+            nm = "return"
 
         # return / value discard
         if nm == "return":
@@ -803,21 +812,25 @@ class DecompileEngine:
                     self._w(o, "return;")
             else:
                 self._w(o, "return;")
-            # Close any open if-blocks at function exit
-            # When inside a while loop, only close if-blocks opened inside the loop
-            if self._while_open:
-                wh = self._while_open[-1][0]
-                close_count = 0
-                while self._open_ifs and self._open_ifs[-1][0] > wh:
-                    self._open_ifs.pop()
-                    close_count += 1
-                if close_count > 0:
+            if not is_retrval:
+                # Ordinary returns terminate the source-level branch.  RETRVAL
+                # is different: iterator cleanup runs before it and its branch
+                # must remain open until the bytecode target is reached.
+                if self._while_open:
+                    wh = self._while_open[-1][0]
+                    close_count = 0
+                    while self._open_ifs and self._open_ifs[-1][0] > wh:
+                        self._open_ifs.pop()
+                        close_count += 1
+                    if close_count > 0:
+                        self._w(o, "}" * close_count)
+                elif self._open_ifs:
+                    close_count = len(self._open_ifs)
+                    self._open_ifs.clear()
                     self._w(o, "}" * close_count)
-            elif self._open_ifs:
-                close_count = len(self._open_ifs)
-                self._open_ifs.clear()
-                self._w(o, "}" * close_count)
-        elif nm in ("pop", "popv", "setrval"):
+        elif nm == "setrval":
+            self._rval = self._pop()
+        elif nm in ("pop", "popv"):
             if self._skip_next_pop:
                 self._skip_next_pop = False
                 return
@@ -880,6 +893,12 @@ class DecompileEngine:
             v = self._pop()
             tgt = o + p.get("offset", 0)
             cond = v.get_value()
+            if self._pending_logic is not None:
+                logic_op, lhs = self._pending_logic
+                self._pending_logic = None
+                if self._stack and self._stack[-1].type == "logic":
+                    self._pop()
+                cond = f"({lhs} {logic_op} {cond})"
             if o in self._ternary_ifs:
                 info = self._ternary_ifs[o]
                 then_val = self._eval_range(*info["then_rng"])
@@ -909,6 +928,12 @@ class DecompileEngine:
             v = self._pop()
             tgt = o + p.get("offset", 0)
             cond = v.get_value()
+            if self._pending_logic is not None:
+                logic_op, lhs = self._pending_logic
+                self._pending_logic = None
+                if self._stack and self._stack[-1].type == "logic":
+                    self._pop()
+                cond = f"({lhs} {logic_op} {cond})"
             if o in self._iter_ifnes:
                 pass
             elif o in self._while_loop_ifnes:
@@ -1445,6 +1470,7 @@ class DecompileEngine:
                 is_cocos = getattr(self.d, "is_cocos", False)
                 if is_cocos and not is_prefix:
                     skip = False
+                    skip_count = 0
                     ops = self.d.ops
                     for si in range(len(ops)):
                         if ops[si]["off"] == o and ops[si]["nm"] == nm:
@@ -1469,10 +1495,25 @@ class DecompileEngine:
                                     and seq[8] == "pop"
                                 ):
                                     skip = True
+                                    skip_count = 8
+                                elif (
+                                    seq[0] == "pop"
+                                    and seq[1] == "getaliasedvar"
+                                    and sslots[1] == slot
+                                    and seq[2] == "pos"
+                                    and seq[3] == "dup"
+                                    and seq[4] == "one"
+                                    and seq[5] == arith
+                                    and seq[6] == "setaliasedvar"
+                                    and sslots[6] == slot
+                                    and seq[7] == "pop"
+                                ):
+                                    skip = True
+                                    skip_count = 8
                             break
                     if skip:
                         self._push(tp="script", script=f"({var_name}{op})")
-                        self._skip_ops_count = 8
+                        self._skip_ops_count = skip_count
                         return
                 if is_prefix:
                     self._push(tp="script", script=f"{op}{var_name}")
@@ -1489,24 +1530,25 @@ class DecompileEngine:
                 "gnamedec",
             ):
                 name = self._push_name(p.get("idx", 0))
-                is_cocos_name = getattr(self.d, "is_cocos", False) and nm in (
-                    "incname",
-                    "decname",
-                )
+                is_cocos_name = getattr(self.d, "is_cocos", False)
                 if is_cocos_name:
                     skip = False
                     skip_count = 0
                     ops = self.d.ops
                     for si in range(len(ops)):
                         if ops[si]["off"] == o and ops[si]["nm"] == nm:
-                            if si + 7 < len(ops):
-                                seq = [ops[si + k]["nm"] for k in range(1, 8)]
+                            if si + 11 < len(ops):
+                                seq = [ops[si + k]["nm"] for k in range(1, 12)]
                                 sidxs = [
                                     ops[si + k].get("params", {}).get("idx", -1)
-                                    for k in range(1, 8)
+                                    for k in range(1, 12)
                                 ]
                                 arith = "add" if is_inc else "sub"
-                                if (
+                                # Cocos emits both the compact inc/dec opcode and
+                                # its expanded implementation.  The compact opcode
+                                # already has the correct prefix/postfix value, so
+                                # consume the duplicate expansion.
+                                if is_prefix and (
                                     seq[0] == "pop"
                                     and seq[1] in ("bindname", "name")
                                     and seq[2] == "name"
@@ -1514,10 +1556,30 @@ class DecompileEngine:
                                     and seq[4] == "one"
                                     and seq[5] == arith
                                     and seq[6] == "setname"
+                                    and sidxs[1] == p.get("idx", 0)
+                                    and sidxs[2] == p.get("idx", 0)
                                     and sidxs[6] == sidxs[1]
                                 ):
                                     skip = True
                                     skip_count = 7
+                                elif not is_prefix and (
+                                    seq[0] == "pop"
+                                    and seq[1] == "bindname"
+                                    and seq[2] == "name"
+                                    and seq[3] == "pos"
+                                    and seq[4] == "dup"
+                                    and seq[5] == "one"
+                                    and seq[6] == arith
+                                    and seq[7] == "pick"
+                                    and seq[8] == "swap"
+                                    and seq[9] == "setname"
+                                    and seq[10] == "pop"
+                                    and sidxs[1] == p.get("idx", 0)
+                                    and sidxs[2] == p.get("idx", 0)
+                                    and sidxs[9] == p.get("idx", 0)
+                                ):
+                                    skip = True
+                                    skip_count = 11
                             break
                     if skip:
                         if is_prefix:

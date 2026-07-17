@@ -62,6 +62,7 @@ def parse_code(data, code_start, code_end):
         nm = info["name"]
         ol = info["length"]
         params = _extract_params(data, o, nm, ol)
+        ol = params.get("_real_len", ol)
         if ol <= 0:
             ol = 1
         if "offset" in params:
